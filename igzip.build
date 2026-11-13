@@ -1,0 +1,9 @@
+// The native part is CMake: CMakeLists.txt builds the shim in src/ and ISA-L
+// itself from the pinned submodule in vendor/isa-l. Nothing has to be
+// installed on the machine beyond a C compiler, cmake, git for the submodule,
+// and nasm for ISA-L's x86-64 kernels.
+cmake_target = "igzip_goose";
+
+// These hold programs and third-party sources, not the package's modules. The
+// JIT's symbol table does not look for the package's externs there.
+exclude = ["examples", "test", "vendor"];

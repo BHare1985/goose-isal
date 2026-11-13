@@ -1,0 +1,5 @@
+# Build output, and the agent workspace: language reference copies, harness
+# notes and prompt templates that belong to one machine, not to the package.
+# AGENTS.md is tracked; .pi/ is not.
+build/
+.pi/
