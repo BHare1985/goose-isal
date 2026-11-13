@@ -47,6 +47,10 @@ No new API; what real traffic finds.
 
 ## 0.2.0 — streaming deflate and gzip header control
 
+**Design brief: [docs/design/0.2.0.md](docs/design/0.2.0.md).** It states the
+problem, the constraints, the ISA-L facts already established, and the questions
+a design has to answer.
+
 For bodies produced in pieces, and for byte-identical repeats.
 
 - `isal_deflate` with `NO_FLUSH`, `SYNC_FLUSH`, `FULL_FLUSH`: compress as a
