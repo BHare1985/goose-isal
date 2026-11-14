@@ -53,8 +53,9 @@ enum Wrapper {
     Zlib, // zlib (RFC 1950)
 }
 
-// The largest input this package accepts, in bytes. igzip's lengths are 32-bit,
-// so anything above is rejected rather than truncated.
+// The largest input the one-shot path accepts, in bytes. igzip's lengths are
+// 32-bit, so `compress` rejects anything above rather than truncating; a
+// `Writer` splits larger inputs into windows.
 let MAX_INPUT = 0x7FFFFFF0;
 
 // How a call ended. `Ok` is the only success.
@@ -63,9 +64,10 @@ enum Status {
     Overflow,     // input too large for igzip's 32-bit lengths
     BadLevel,     // level outside 0..3
     BadLevelBuf,  // igzip's level buffer unusable
-    BadState,     // a value was never initialized
+    BadState,     // call not allowed in this state
     BadWrapper,   // invalid flush or wrapper
     BadTable,     // the histogram produced an invalid table
+    BadHeader,    // a gzip or zlib header this API cannot encode
     Other,        // an igzip error this package does not name
 }
 
@@ -102,6 +104,76 @@ struct Trainer {
 }
 
 // ---------------------------------------------------------------------------
+// Streaming writer
+// ---------------------------------------------------------------------------
+
+// Flush points. `Sync` byte-aligns the stream and ends the current stored
+// block, so everything written so far is a complete decode point; `Full` also
+// drops the LZ77 history, so the next block is independent of it.
+enum Flush { Sync, Full }
+
+// The writer's lifecycle. Every operation is legal in only some of these
+// states; a call in the wrong one returns `Status.BadState` instead of
+// corrupting the stream.
+enum WriterState {
+    Fresh,          // nothing written yet; headers and a dictionary may be set
+    HeaderWritten,  // a custom gzip or zlib header is already in the output
+    Open,           // body bytes written, no flush pending
+    Flushed,        // the last call completed a Sync or Full flush
+    Finished,       // the trailer is written; only `reset` is legal
+}
+
+// A custom gzip header. RFC 1952's mtime defaults to 0 and the OS byte to
+// 0xff, so two runs over the same input produce identical bytes. `name` and
+// `comment` are NUL-terminated on the wire; the wrapper adds that terminator.
+// `extra` is length-prefixed and may contain any bytes.
+struct GzipHeader {
+    text:    bool        = false,
+    mtime:   u32         = 0,
+    xflags:  u8          = 0,
+    os:      u8          = 0xff,
+    hcrc:    bool        = false,
+    name:    const u8[:] = "",
+    comment: const u8[:] = "",
+    extra:   const u8[:] = "",
+}
+
+// A custom zlib header. `window_bits` is 8..15; `flevel` is the 0..3 hint
+// (0 = fastest, 3 = maximum). A preset dictionary set with `set_dict` forces
+// `dict_flag` and supplies the DICTID.
+struct ZlibHeader {
+    window_bits: u8   = 15,
+    flevel:      u8   = 0,
+    dict_flag:   bool = false,
+    dict_id:     u32  = 0,
+}
+
+// A streaming deflater: 367,280 bytes of igzip state, a 64 KiB output staging
+// buffer, its wrapper and level, and its own copy of an optional trained table.
+//
+// The C stream keeps pointers into `level_buf` and `tables`. A fixed-size Goose
+// value can be copied by assignment, so a copy made after the writer has been
+// initialized (a write, a header, `set_dict` or `set_tables`) would leave those
+// pointers in the original; the C side records the Writer's address and returns
+// `Status.BadState` for such a copy. Call `reset` to recover a copy.
+struct Writer {
+    stream:      u64[10298]  = [0; 10298],
+    level_buf:   u64[27136]  = [0; 27136],
+    chunk:       u8[65536]   = [0; 65536],
+    tables:      u64[279]    = [0; 279],
+    pinned_self: u64         = 0,
+    total_in:    u64         = 0,
+    total_out:   u64         = 0,
+    dict_id:     u32         = 0,
+    base_level:  i32         = 1,
+    wrap:        Wrapper     = Wrapper.Gzip,
+    state:       WriterState = WriterState.Fresh,
+    has_tables:  bool        = false,
+    has_dict:    bool        = false,
+    hdr_written: bool        = false,
+}
+
+// ---------------------------------------------------------------------------
 // C surface (src/igzip_shim.c)
 // ---------------------------------------------------------------------------
 
@@ -122,6 +194,19 @@ extern fn igzip_gs_hist_import(t: Trainer&, src: const Histogram&);
 extern fn igzip_gs_compress(c: Compressor&, src: const u8[:], out: u8[>..]&, level: i32, wrap: i32) -> i32;
 extern fn igzip_gs_compress_trained(c: Compressor&, t: const HuffTables&, src: const u8[:], out: u8[>..]&, wrap: i32) -> i32;
 
+extern fn igzip_gs_writer_size() -> i64;
+extern fn igzip_gs_writer_reset(w: Writer&) -> i32;
+extern fn igzip_gs_writer_gzip_header(w: Writer&, text: bool, mtime: u32, xflags: u8, os: u8,
+    hcrc: bool, name: const u8[:], comment: const u8[:], extra: const u8[:], dst: u8[:],
+    out_written: u32&, out_needed: u32&) -> i32;
+extern fn igzip_gs_writer_zlib_header(w: Writer&, window_bits: u8, flevel: u8, dict_flag: bool,
+    dict_id: u32, dst: u8[:], out_written: u32&) -> i32;
+extern fn igzip_gs_writer_set_dict(w: Writer&, dict: const u8[:]) -> i32;
+extern fn igzip_gs_writer_set_tables(w: Writer&, t: const HuffTables&) -> i32;
+extern fn igzip_gs_writer_clear_tables(w: Writer&) -> i32;
+extern fn igzip_gs_writer_step(w: Writer&, src: const u8[:], mode: u8, dst: u8[:],
+    out_consumed: u32&, out_written: u32&, out_more: bool&) -> i32;
+
 fn wrapper_code(w: Wrapper) -> i32 {
     return match w {
         Raw => 0,
@@ -138,6 +223,8 @@ fn status_of(rc: i32) -> Status {
         -4 => Status.BadLevel,
         -5 => Status.BadLevelBuf,
         -7 => Status.BadWrapper,
+        -8 => Status.BadHeader,
+        -9 => Status.BadState,
         _ => Status.Other,
     };
 }
@@ -209,6 +296,196 @@ fn set_tables(c: Compressor&, t: HuffTables&) {
 fn clear_tables(c: Compressor&, level: i32 = 1) {
     c.trained = false;
     c.level = level;
+}
+
+// ---------------------------------------------------------------------------
+// Streaming writers
+// ---------------------------------------------------------------------------
+
+// The largest slice one shim call can pass to igzip; longer writes are split
+// into windows of this size. It is `MAX_INPUT` because `avail_in` is 32-bit.
+let MAX_IN_STEP = 0x7FFFFFF0;
+
+// A writer for any wrapper and level. The stream is initialized on first use,
+// not here, so returning the value from a function or storing it in an array
+// cannot leave a C pointer to a dead local.
+fn writer(wrap: Wrapper, level: i32 = 1) -> Writer {
+    return Writer { wrap: wrap, base_level: level, .. };
+}
+
+fn gzip_writer(level: i32 = 1) -> Writer {
+    return writer(Wrapper.Gzip, level);
+}
+
+fn zlib_writer(level: i32 = 1) -> Writer {
+    return writer(Wrapper.Zlib, level);
+}
+
+fn raw_writer(level: i32 = 1) -> Writer {
+    return writer(Wrapper.Raw, level);
+}
+
+// The exact byte size of a Writer, checked against the C mirror.
+fn writer_size() -> i64 {
+    return igzip_gs_writer_size();
+}
+
+// Compresses `src` in windows of at most `step` bytes. `write` uses this with
+// MAX_IN_STEP; tests use a smaller step to exercise the same code path without
+// allocating a 2 GiB input.
+fn write_windowed(w: Writer&, src: const u8[:], out: u8[>..]&, step: i64) -> Status {
+    guard step > 0 && step <= MAX_INPUT else { return Status.Overflow; }
+    var pos: i64 = 0;
+    while pos < src.len {
+        var n = src.len - pos;
+        if n > step { n = step; }
+        let err = write_window(w, src[pos..pos + n], out);
+        if err != Status.Ok { return err; }
+        pos += n;
+    }
+    return Status.Ok;
+}
+
+// Appends the compressed bytes for `src` to `out`. All of `src` is consumed
+// before returning; the writer stages igzip's output through its 64 KiB chunk.
+fn write(w: Writer&, src: const u8[:], out: u8[>..]&) -> Status {
+    return write_windowed(w, src, out, MAX_IN_STEP);
+}
+
+// One window: feed igzip until it has taken every byte of `src` and drained
+// its output. A zero-progress result would loop forever, so it is a Status
+// rather than a hang.
+fn write_window(w: Writer&, src: const u8[:], out: u8[>..]&) -> Status {
+    var consumed: i64 = 0;
+    loop {
+        var used:    u32 = 0;
+        var written: u32 = 0;
+        var more = false;
+        let rc = igzip_gs_writer_step(w, src[consumed..], 0, w.chunk, used, written, more);
+        if rc != 0 { return status_of(rc); }
+        if written > 0 { out.append(w.chunk[..written]); }
+        consumed += used;
+        if !more { return Status.Ok; }
+        if used == 0 && written == 0 { return Status.Other; }
+    }
+}
+
+// A Sync flush: everything written so far is a complete decode point. The
+// two-argument form is the common one; the three-argument form selects Full.
+fn flush(w: Writer&, out: u8[>..]&) -> Status {
+    return flush(w, Flush.Sync, out);
+}
+
+fn flush(w: Writer&, mode: Flush, out: u8[>..]&) -> Status {
+    let code: u8 = match mode {
+        Sync => 1,
+        Full => 2,
+    };
+    return step_empty(w, code, out);
+}
+
+// Writes the final block and trailer. The writer cannot be used again until
+// `reset`.
+fn finish(w: Writer&, out: u8[>..]&) -> Status {
+    return step_empty(w, 3, out);
+}
+
+fn step_empty(w: Writer&, mode: u8, out: u8[>..]&) -> Status {
+    loop {
+        var used:    u32 = 0;
+        var written: u32 = 0;
+        var more = false;
+        let rc = igzip_gs_writer_step(w, "", mode, w.chunk, used, written, more);
+        if rc != 0 { return status_of(rc); }
+        if written > 0 { out.append(w.chunk[..written]); }
+        if !more { return Status.Ok; }
+        if used == 0 && written == 0 { return Status.Other; }
+    }
+}
+
+// Returns the writer to Fresh, preserving its wrapper, base level and trained
+// table, and dropping the dictionary and any header. This is how a server
+// reuses one writer for the next response, and how a mid-stream copy recovers.
+fn reset(w: Writer&) -> Status {
+    return status_of(igzip_gs_writer_reset(w));
+}
+
+// Writes a custom gzip header. RFC 1952 requires name and comment to be
+// NUL-terminated; Goose slices are not, so copies with a trailing 0 are built
+// here and passed to C. The header goes through the 64 KiB chunk unless it is
+// larger than that, in which case it is built in a temporary of the required
+// size and appended.
+fn write_gzip_header(w: Writer&, hdr: GzipHeader, out: u8[>..]&) -> Status {
+    var name_buf: u8[>..] = [];
+    if hdr.name.len > 0 {
+        name_buf.append(hdr.name);
+        name_buf.push(0);
+    }
+    var comment_buf: u8[>..] = [];
+    if hdr.comment.len > 0 {
+        comment_buf.append(hdr.comment);
+        comment_buf.push(0);
+    }
+
+    var written: u32 = 0;
+    var needed:  u32 = 0;
+    let rc = igzip_gs_writer_gzip_header(w, hdr.text, hdr.mtime, hdr.xflags, hdr.os, hdr.hcrc,
+                                        name_buf, comment_buf, hdr.extra, w.chunk, written, needed);
+    if rc != 0 { return status_of(rc); }
+
+    if needed > 0 {
+        // Larger than the 64 KiB chunk. Build the header in a temporary of
+        // exactly the required size; `out` may be one of the arrays `hdr`'s
+        // slices point into, and growing it while those views are live is not
+        // legal.
+        var big: u8[>..] = [];
+        for i in needed { big.push(0); }
+        var written2: u32 = 0;
+        var needed2:  u32 = 0;
+        let rc2 = igzip_gs_writer_gzip_header(w, hdr.text, hdr.mtime, hdr.xflags, hdr.os, hdr.hcrc,
+                                             name_buf, comment_buf, hdr.extra, big,
+                                             written2, needed2);
+        if rc2 != 0 { return status_of(rc2); }
+        if needed2 > 0 { return Status.BadHeader; }
+        out.append(big[..written2]);
+        return Status.Ok;
+    }
+
+    if written > 0 { out.append(w.chunk[..written]); }
+    return Status.Ok;
+}
+
+// Writes a custom zlib header. If a dictionary was set, FDICT and DICTID are
+// filled in automatically, because a zlib decoder rejects a dictionary stream
+// whose header does not advertise one.
+fn write_zlib_header(w: Writer&, hdr: ZlibHeader, out: u8[>..]&) -> Status {
+    var written: u32 = 0;
+    let rc = igzip_gs_writer_zlib_header(w, hdr.window_bits, hdr.flevel, hdr.dict_flag,
+                                        hdr.dict_id, w.chunk, written);
+    if rc != 0 { return status_of(rc); }
+    if written > 0 { out.append(w.chunk[..written]); }
+    return Status.Ok;
+}
+
+// Sets a preset dictionary. Legal only on raw and zlib writers before the
+// first byte. igzip copies the last 32 KiB into its own history buffer, so the
+// slice does not have to outlive the call.
+fn set_dict(w: Writer&, dict: const u8[:]) -> Status {
+    guard dict.len <= MAX_INPUT else { return Status.Overflow; }
+    return status_of(igzip_gs_writer_set_dict(w, dict));
+}
+
+// Attaches a trained table to a writer. As with `Compressor`, a supplied table
+// is used at level 0 only, so this pins the level to 0. Legal before the first
+// byte and after a completed Sync or Full flush.
+fn set_tables(w: Writer&, t: const HuffTables&) -> Status {
+    guard igzip_gs_tables_check(t) == 0 else { return Status.BadTable; }
+    return status_of(igzip_gs_writer_set_tables(w, t));
+}
+
+// Drops the trained table and returns to the writer's base level.
+fn clear_tables(w: Writer&) -> Status {
+    return status_of(igzip_gs_writer_clear_tables(w));
 }
 
 // ---------------------------------------------------------------------------
@@ -300,9 +577,10 @@ fn status_name(e: Status) -> const u8[:] {
         Overflow => "input too large for igzip's 32-bit lengths",
         BadLevel => "compression level must be 0..3",
         BadLevelBuf => "igzip level buffer unusable",
-        BadState => "state value was not initialized",
+        BadState => "call is not allowed in this writer state",
         BadWrapper => "invalid flush or wrapper",
         BadTable => "histogram produced an invalid table",
+        BadHeader => "gzip or zlib header field cannot be encoded",
         Other => "igzip reported an error this package does not name",
     };
 }

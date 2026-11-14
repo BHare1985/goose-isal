@@ -45,21 +45,23 @@ No new API; what real traffic finds.
   rather than assumed.
 - Decide whether `bound()` should account for multi-member buffers.
 
-## 0.2.0 — streaming deflate and gzip header control
+## Shipped: 0.2.0 — streaming deflate and gzip header control
 
-**Design brief: [docs/design/0.2.0.md](docs/design/0.2.0.md).** It states the
-problem, the constraints, the ISA-L facts already established, and the questions
-a design has to answer.
+**Design brief: [docs/design/0.2.0.md](docs/design/0.2.0.md).**
 
-For bodies produced in pieces, and for byte-identical repeats.
+For bodies produced in pieces, and for byte-identical repeats. The result is a
+separate `Writer` (367,280 B), not a mode on `Compressor`:
 
-- `isal_deflate` with `NO_FLUSH`, `SYNC_FLUSH`, `FULL_FLUSH`: compress as a
-  response is generated instead of buffering it whole.
-- `isal_write_gzip_header` with a filled `isal_gzip_header`: custom mtime and OS
-  byte, plus `GZIP_NO_HDR`, so a cache can emit a stable header and vary only
-  the deflate body.
-- Lifting the 2 GiB input limit: feed igzip one 32-bit length at a time.
-- `isal_deflate_set_dictionary` for shared-prefix bodies.
+- `write` / `flush(Sync|Full)` / `finish` / `reset`, with a `Fresh →
+  HeaderWritten → Open → Flushed → Finished` lifecycle and `BadState` on misuse.
+- `GzipHeader` and `ZlibHeader` written explicitly ahead of the first body byte;
+  the trailer is automatic. Large headers bypass the 64 KiB chunk.
+- `set_dict` for raw and zlib, with the FDICT/DICTID header igzip's default zlib
+  path omits.
+- `set_tables` / `clear_tables`, level-pinned to 0 and legal after a flush.
+- Inputs past 2 GiB are split into windows in `write`; `test/large_stream.goose`
+  streams 4.2 GiB and checks the wrapped gzip ISIZE.
+- A mid-stream copy is rejected by a `pinned_self` check; `reset` recovers it.
 
 ## 0.3.0 — inflate
 

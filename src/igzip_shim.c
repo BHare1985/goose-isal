@@ -26,6 +26,7 @@
  *      against stale offsets, so every call clears it and keeps the counters.
  */
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -86,6 +87,67 @@ typedef struct {
 typedef struct {
 	uint64_t raw_g[279];
 } HuffTables_g;
+
+/* Writer: the streaming state. Its size is pinned because Goose allocates it
+ * inline and C casts the u64 arrays back to the ISA-L types. The field order
+ * matches igzip.goose; every offset below is asserted. */
+#define GS_WRAP_RAW 0
+#define GS_WRAP_GZIP 1
+#define GS_WRAP_ZLIB 2
+
+#define GS_FRESH 0
+#define GS_HDR 1
+#define GS_OPEN 2
+#define GS_FLUSHED 3
+#define GS_FINISHED 4
+
+#define GS_CHUNK 65536
+
+/* Not an ISA-L code: a header field the API cannot encode (an interior NUL,
+ * too-long name/comment/extra, or an impossible zlib flag). */
+#define IGZIP_GS_BAD_HEADER (-8)
+
+typedef struct {
+	uint64_t stream[sizeof(struct isal_zstream) / 8];
+	uint64_t level_buf[ISAL_LEVEL_BUF / 8];
+	uint8_t chunk[GS_CHUNK];
+	uint64_t tables[sizeof(struct isal_hufftables) / 8];
+	uint64_t pinned_self;
+	uint64_t total_in;
+	uint64_t total_out;
+	uint32_t dict_id;
+	int32_t base_level;
+	uint8_t wrap;
+	uint8_t state;
+	bool has_tables;
+	bool has_dict;
+	bool hdr_written;
+} GooseWriter;
+
+_Static_assert(sizeof(bool) == 1, "Goose bool must be one byte for the Writer mirror");
+_Static_assert(sizeof(GooseWriter) == 367280, "Writer size changed; update igzip.goose");
+_Static_assert(_Alignof(GooseWriter) >= 8, "Writer must be 8-byte aligned for isal_zstream");
+_Static_assert(sizeof(((GooseWriter *)0)->stream) == sizeof(struct isal_zstream),
+	       "Writer.stream must hold an isal_zstream");
+_Static_assert(sizeof(((GooseWriter *)0)->level_buf) == ISAL_LEVEL_BUF,
+	       "Writer.level_buf must be ISAL_LEVEL_BUF bytes");
+_Static_assert(sizeof(((GooseWriter *)0)->tables) == sizeof(struct isal_hufftables),
+	       "Writer.tables must hold an isal_hufftables");
+_Static_assert(sizeof(((GooseWriter *)0)->chunk) == GS_CHUNK, "Writer.chunk must be 64 KiB");
+_Static_assert(offsetof(GooseWriter, stream) == 0, "Writer.stream offset");
+_Static_assert(offsetof(GooseWriter, level_buf) == 82384, "Writer.level_buf offset");
+_Static_assert(offsetof(GooseWriter, chunk) == 299472, "Writer.chunk offset");
+_Static_assert(offsetof(GooseWriter, tables) == 365008, "Writer.tables offset");
+_Static_assert(offsetof(GooseWriter, pinned_self) == 367240, "Writer.pinned_self offset");
+_Static_assert(offsetof(GooseWriter, total_in) == 367248, "Writer.total_in offset");
+_Static_assert(offsetof(GooseWriter, total_out) == 367256, "Writer.total_out offset");
+_Static_assert(offsetof(GooseWriter, dict_id) == 367264, "Writer.dict_id offset");
+_Static_assert(offsetof(GooseWriter, base_level) == 367268, "Writer.base_level offset");
+_Static_assert(offsetof(GooseWriter, wrap) == 367272, "Writer.wrap offset");
+_Static_assert(offsetof(GooseWriter, state) == 367273, "Writer.state offset");
+_Static_assert(offsetof(GooseWriter, has_tables) == 367274, "Writer.has_tables offset");
+_Static_assert(offsetof(GooseWriter, has_dict) == 367275, "Writer.has_dict offset");
+_Static_assert(offsetof(GooseWriter, hdr_written) == 367276, "Writer.hdr_written offset");
 
 _Static_assert(sizeof(igzip_comp_state) % 8 == 0, "Compressor must be a whole number of u64");
 _Static_assert(sizeof(igzip_train_state) % 8 == 0, "Trainer must be a whole number of u64");
@@ -271,4 +333,418 @@ int32_t igzip_gs_compress_trained(Compressor_g *s, const HuffTables_g *t, igzip_
 				 gs_rref out, int32_t wrap) {
 	if (!t) return ISAL_INVALID_STATE;
 	return run(s, src, out, 0, wrap, t);
+}
+
+/* ---- streaming writer ---------------------------------------------------- */
+
+static uint16_t writer_flag(uint8_t wrap) {
+	if (wrap == GS_WRAP_GZIP) return IGZIP_GZIP;
+	if (wrap == GS_WRAP_ZLIB) return IGZIP_ZLIB;
+	return IGZIP_DEFLATE;
+}
+
+static struct isal_zstream *writer_stream(GooseWriter *w) {
+	return (struct isal_zstream *)(void *)w->stream;
+}
+
+static struct isal_hufftables *writer_tables(GooseWriter *w) {
+	return (struct isal_hufftables *)(void *)w->tables;
+}
+
+/* Levels 1-3 need the level buffer; level 0 must not have one, matching the
+ * stateless path in 0.1.0. */
+static void writer_set_level(GooseWriter *w, struct isal_zstream *s, int32_t level) {
+	s->level = (uint32_t)level;
+	if (level > 0) {
+		s->level_buf = (uint8_t *)(void *)w->level_buf;
+		s->level_buf_size = (uint32_t)sizeof w->level_buf;
+	} else {
+		s->level_buf = NULL;
+		s->level_buf_size = 0;
+	}
+}
+
+/* Initializes the C stream on first use, or verifies that this exact Writer is
+ * the one the C stream points into. A fixed-size Goose value can be copied by
+ * assignment; after that, level_buf and a custom table would point into the
+ * original. Callers reach that through a mismatch and get BadState. */
+static int32_t writer_pin_at(GooseWriter *w, int32_t level) {
+	if (!w) return ISAL_INVALID_STATE;
+	if (w->wrap > GS_WRAP_ZLIB) return INVALID_FLUSH;
+	if (w->state > GS_FINISHED) return ISAL_INVALID_STATE;
+
+	if (w->state == GS_FRESH) {
+		if (w->pinned_self == (uint64_t)(uintptr_t)w) return COMP_OK;
+		/* A Fresh Writer that has already been used for set_dict or
+		 * set_tables must not be re-initialized: the dictionary lives in the
+		 * stream buffer, not in a field the shim could replay. */
+		if (w->pinned_self != 0) return ISAL_INVALID_STATE;
+		struct isal_zstream *s = writer_stream(w);
+		isal_deflate_init(s);
+		writer_set_level(w, s, level);
+		s->gzip_flag = writer_flag(w->wrap);
+		if (w->has_tables) s->hufftables = writer_tables(w);
+		w->pinned_self = (uint64_t)(uintptr_t)w;
+		return COMP_OK;
+	}
+
+	if (w->pinned_self != (uint64_t)(uintptr_t)w) return ISAL_INVALID_STATE;
+	return COMP_OK;
+}
+
+static int32_t writer_pin(GooseWriter *w) {
+	if (!w) return ISAL_INVALID_STATE;
+	int32_t level = w->has_tables ? 0 : w->base_level;
+	if (level < 0 || level > 3) return ISAL_INVALID_LEVEL;
+	return writer_pin_at(w, level);
+}
+
+/* The zlib header that carries a preset dictionary. ISA-L's IGZIP_ZLIB path
+ * writes FDICT=0, so a stream with a dictionary needs this six-byte header
+ * first and gzip_flag=IGZIP_ZLIB_NO_HDR afterwards. */
+static int32_t writer_auto_zlib(GooseWriter *w, struct isal_zstream *s, igzip_slice_u8 *dst,
+				uint32_t *written) {
+	if (dst->len < 6) return IGZIP_GS_BAD_HEADER;
+	struct isal_zlib_header z;
+	isal_zlib_header_init(&z);
+	z.info = 7; /* 32 KiB window */
+	z.level = w->base_level == 0 ? 0 : 1;
+	z.dict_flag = 1;
+	z.dict_id = w->dict_id;
+
+	uint32_t before = s->total_out;
+	s->next_out = (uint8_t *)(uintptr_t)dst->data;
+	s->avail_out = (uint32_t)dst->len;
+	uint32_t need = isal_write_zlib_header(s, &z);
+	s->next_out = NULL;
+	s->avail_out = 0;
+	if (need != 0) return IGZIP_GS_BAD_HEADER;
+	s->gzip_flag = IGZIP_ZLIB_NO_HDR;
+
+	uint32_t n = s->total_out - before;
+	*written = n;
+	dst->data += n;
+	dst->len -= n;
+	w->total_out += n;
+	w->hdr_written = true;
+	w->state = GS_HDR;
+	return COMP_OK;
+}
+
+/* A Goose slice is not NUL-terminated. The public wrapper appends the 0 and
+ * passes a length that includes it; this checks the contract instead of
+ * trusting it. */
+static int32_t writer_cstr_ok(igzip_slice_u8 s) {
+	if (s.len < 0 || (uint64_t)s.len > UINT32_MAX) return IGZIP_GS_BAD_HEADER;
+	if (s.len == 0) return COMP_OK;
+	if (!s.data) return IGZIP_GS_BAD_HEADER;
+	if (s.data[s.len - 1] != 0) return IGZIP_GS_BAD_HEADER;
+	for (int64_t i = 0; i + 1 < s.len; i++) {
+		if (s.data[i] == 0) return IGZIP_GS_BAD_HEADER;
+	}
+	return COMP_OK;
+}
+
+int64_t igzip_gs_writer_size(void) { return (int64_t)sizeof(GooseWriter); }
+
+int32_t igzip_gs_writer_reset(GooseWriter *w) {
+	if (!w) return ISAL_INVALID_STATE;
+	struct isal_zstream *s = writer_stream(w);
+	isal_deflate_reset(s);
+	s->end_of_stream = 0;
+	s->flush = NO_FLUSH;
+	s->gzip_flag = writer_flag(w->wrap);
+	s->level = w->has_tables ? 0 : (uint32_t)w->base_level;
+	if (s->level > 0) {
+		s->level_buf = (uint8_t *)(void *)w->level_buf;
+		s->level_buf_size = (uint32_t)sizeof w->level_buf;
+	} else {
+		s->level_buf = NULL;
+		s->level_buf_size = 0;
+	}
+	if (w->has_tables) {
+		s->hufftables = writer_tables(w);
+	} else {
+		isal_deflate_set_hufftables(s, NULL, IGZIP_HUFFTABLE_DEFAULT);
+	}
+	s->next_in = NULL;
+	s->next_out = NULL;
+	s->avail_in = 0;
+	s->avail_out = 0;
+	w->pinned_self = 0;
+	w->state = GS_FRESH;
+	w->has_dict = false;
+	w->dict_id = 0;
+	w->hdr_written = false;
+	w->total_in = 0;
+	w->total_out = 0;
+	return COMP_OK;
+}
+
+int32_t igzip_gs_writer_gzip_header(GooseWriter *w, bool text, uint32_t mtime, uint8_t xflags,
+				    uint8_t os, bool hcrc, igzip_slice_u8 name,
+				    igzip_slice_u8 comment, igzip_slice_u8 extra,
+				    igzip_slice_u8 dst, uint32_t *out_written,
+				    uint32_t *out_needed) {
+	if (!w || !out_written || !out_needed) return ISAL_INVALID_STATE;
+	if (dst.len < 0 || (uint64_t)dst.len > UINT32_MAX) return STATELESS_OVERFLOW;
+
+	int32_t rc = writer_pin(w);
+	if (rc != COMP_OK) return rc;
+	if (w->state != GS_FRESH || w->wrap != GS_WRAP_GZIP) return ISAL_INVALID_STATE;
+	if (writer_cstr_ok(name) != COMP_OK || writer_cstr_ok(comment) != COMP_OK)
+		return IGZIP_GS_BAD_HEADER;
+	if (extra.len < 0 || (uint64_t)extra.len > UINT16_MAX) return IGZIP_GS_BAD_HEADER;
+
+	struct isal_gzip_header h;
+	isal_gzip_header_init(&h);
+	h.text = text ? 1 : 0;
+	h.time = mtime;
+	h.xflags = xflags;
+	h.os = os;
+	h.hcrc = hcrc ? 1 : 0;
+	if (extra.len > 0) {
+		h.extra = (uint8_t *)(uintptr_t)extra.data;
+		h.extra_buf_len = (uint32_t)extra.len;
+		h.extra_len = (uint32_t)extra.len;
+	}
+	if (name.len > 0) {
+		h.name = (char *)(uintptr_t)name.data;
+		h.name_buf_len = (uint32_t)name.len;
+	}
+	if (comment.len > 0) {
+		h.comment = (char *)(uintptr_t)comment.data;
+		h.comment_buf_len = (uint32_t)comment.len;
+	}
+
+	struct isal_zstream *s = writer_stream(w);
+	uint32_t before = s->total_out;
+	s->next_out = (uint8_t *)(uintptr_t)dst.data;
+	s->avail_out = (uint32_t)dst.len;
+	uint32_t need = isal_write_gzip_header(s, &h);
+	s->next_out = NULL;
+	s->avail_out = 0;
+	if (need == UINT32_MAX) return IGZIP_GS_BAD_HEADER;
+	if (need != 0) {
+		*out_written = 0;
+		*out_needed = need;
+		return COMP_OK;
+	}
+
+	uint32_t written = s->total_out - before;
+	s->gzip_flag = IGZIP_GZIP_NO_HDR;
+	w->total_out += written;
+	w->state = GS_HDR;
+	w->hdr_written = true;
+	*out_written = written;
+	*out_needed = 0;
+	return COMP_OK;
+}
+
+int32_t igzip_gs_writer_zlib_header(GooseWriter *w, uint8_t window_bits, uint8_t flevel,
+				    bool dict_flag, uint32_t dict_id, igzip_slice_u8 dst,
+				    uint32_t *out_written) {
+	if (!w || !out_written) return ISAL_INVALID_STATE;
+	if (dst.len < 6 || (uint64_t)dst.len > UINT32_MAX) return IGZIP_GS_BAD_HEADER;
+
+	int32_t rc = writer_pin(w);
+	if (rc != COMP_OK) return rc;
+	if (w->state != GS_FRESH || w->wrap != GS_WRAP_ZLIB) return ISAL_INVALID_STATE;
+	if (window_bits < 8 || window_bits > 15 || flevel > 3) return IGZIP_GS_BAD_HEADER;
+
+	bool use_dict = dict_flag;
+	uint32_t use_id = dict_id;
+	if (w->has_dict) {
+		if (use_dict && use_id != w->dict_id) return IGZIP_GS_BAD_HEADER;
+		use_dict = true;
+		use_id = w->dict_id;
+	} else if (use_dict) {
+		return IGZIP_GS_BAD_HEADER;
+	}
+
+	struct isal_zlib_header z;
+	isal_zlib_header_init(&z);
+	z.info = (uint32_t)(window_bits - 8);
+	z.level = flevel;
+	z.dict_flag = use_dict ? 1 : 0;
+	z.dict_id = use_id;
+
+	struct isal_zstream *s = writer_stream(w);
+	uint32_t before = s->total_out;
+	s->next_out = (uint8_t *)(uintptr_t)dst.data;
+	s->avail_out = (uint32_t)dst.len;
+	uint32_t need = isal_write_zlib_header(s, &z);
+	s->next_out = NULL;
+	s->avail_out = 0;
+	if (need != 0) return IGZIP_GS_BAD_HEADER;
+
+	uint32_t written = s->total_out - before;
+	s->gzip_flag = IGZIP_ZLIB_NO_HDR;
+	w->total_out += written;
+	w->state = GS_HDR;
+	w->hdr_written = true;
+	*out_written = written;
+	return COMP_OK;
+}
+
+int32_t igzip_gs_writer_set_dict(GooseWriter *w, igzip_slice_u8 dict) {
+	int32_t rc = writer_pin(w);
+	if (rc != COMP_OK) return rc;
+	if (w->state != GS_FRESH) return ISAL_INVALID_STATE;
+	if (w->wrap == GS_WRAP_GZIP) return ISAL_INVALID_STATE;
+	if (dict.len < 0 || dict.len > 0x7FFFFFF0) return STATELESS_OVERFLOW;
+	if (dict.len == 0) return COMP_OK;
+
+	struct isal_zstream *s = writer_stream(w);
+	rc = isal_deflate_set_dict(s, (uint8_t *)(uintptr_t)dict.data, (uint32_t)dict.len);
+	if (rc != COMP_OK) return rc;
+
+	w->has_dict = true;
+	w->dict_id = w->wrap == GS_WRAP_ZLIB
+			     ? isal_adler32(1, (const unsigned char *)(uintptr_t)dict.data,
+					    (uint64_t)dict.len)
+			     : 0;
+	return COMP_OK;
+}
+
+int32_t igzip_gs_writer_set_tables(GooseWriter *w, const HuffTables_g *t) {
+	if (!t) return ISAL_INVALID_STATE;
+	/* The table forces level 0, so an out-of-range base level is irrelevant
+	 * here; this matches Compressor.set_tables. */
+	int32_t rc = writer_pin_at(w, 0);
+	if (rc != COMP_OK) return rc;
+	if (w->state != GS_FRESH && w->state != GS_HDR && w->state != GS_FLUSHED)
+		return ISAL_INVALID_STATE;
+
+	rc = igzip_gs_tables_check(t);
+	if (rc != COMP_OK) return rc;
+
+	struct isal_zstream *s = writer_stream(w);
+	bool old = w->has_tables;
+	memcpy(w->tables, t->raw_g, sizeof w->tables);
+	s->hufftables = writer_tables(w);
+	writer_set_level(w, s, 0);
+	rc = isal_deflate_set_hufftables(s, writer_tables(w), IGZIP_HUFFTABLE_CUSTOM);
+	if (rc != COMP_OK) {
+		w->has_tables = old;
+		if (old) {
+			s->hufftables = writer_tables(w);
+			writer_set_level(w, s, 0);
+		} else {
+			isal_deflate_set_hufftables(s, NULL, IGZIP_HUFFTABLE_DEFAULT);
+			writer_set_level(w, s, w->base_level);
+		}
+		return rc;
+	}
+	w->has_tables = true;
+	return COMP_OK;
+}
+
+int32_t igzip_gs_writer_clear_tables(GooseWriter *w) {
+	int32_t rc = writer_pin(w);
+	if (rc != COMP_OK) return rc;
+	if (w->state != GS_FRESH && w->state != GS_HDR && w->state != GS_FLUSHED)
+		return ISAL_INVALID_STATE;
+
+	struct isal_zstream *s = writer_stream(w);
+	writer_set_level(w, s, w->base_level);
+	rc = isal_deflate_set_hufftables(s, NULL, IGZIP_HUFFTABLE_DEFAULT);
+	if (rc != COMP_OK) return rc;
+	w->has_tables = false;
+	return COMP_OK;
+}
+
+/* One step of deflate into dst. mode: 0=write, 1=sync flush, 2=full flush,
+ * 3=finish. src.len is at most MAX_INPUT; the Goose wrapper splits larger
+ * writes into windows. */
+int32_t igzip_gs_writer_step(GooseWriter *w, igzip_slice_u8 src, uint8_t mode,
+			     igzip_slice_u8 dst, uint32_t *out_consumed, uint32_t *out_written,
+			     bool *out_more) {
+	if (!w || !out_consumed || !out_written || !out_more) return ISAL_INVALID_STATE;
+	if (mode > 3) return INVALID_FLUSH;
+	if (src.len < 0 || src.len > 0x7FFFFFF0) return STATELESS_OVERFLOW;
+	if (dst.len < 0 || (uint64_t)dst.len > UINT32_MAX) return STATELESS_OVERFLOW;
+
+	int32_t rc = writer_pin(w);
+	if (rc != COMP_OK) return rc;
+	if (w->state == GS_FINISHED) return ISAL_INVALID_STATE;
+
+	struct isal_zstream *s = writer_stream(w);
+	uint32_t header_written = 0;
+	igzip_slice_u8 body = dst;
+
+	if (w->state == GS_FRESH && w->wrap == GS_WRAP_ZLIB && w->has_dict && !w->hdr_written) {
+		if (body.len < 6) {
+			*out_consumed = 0;
+			*out_written = 0;
+			*out_more = true;
+			return COMP_OK;
+		}
+		rc = writer_auto_zlib(w, s, &body, &header_written);
+		if (rc != COMP_OK) return rc;
+	}
+
+	uint32_t body_cap = (uint32_t)body.len;
+	s->next_in = src.len > 0 ? (uint8_t *)(uintptr_t)src.data : NULL;
+	s->avail_in = (uint32_t)src.len;
+	s->next_out = body.len > 0 ? (uint8_t *)(uintptr_t)body.data : NULL;
+	s->avail_out = body_cap;
+
+	switch (mode) {
+	case 0:
+		s->flush = NO_FLUSH;
+		s->end_of_stream = 0;
+		break;
+	case 1:
+		s->flush = SYNC_FLUSH;
+		s->end_of_stream = 0;
+		break;
+	case 2:
+		s->flush = FULL_FLUSH;
+		s->end_of_stream = 0;
+		break;
+	default:
+		s->flush = NO_FLUSH;
+		s->end_of_stream = 1;
+		break;
+	}
+
+	rc = (int32_t)isal_deflate(s);
+	uint32_t consumed = (uint32_t)src.len - s->avail_in;
+	uint32_t body_written = body_cap - s->avail_out;
+	uint32_t written = header_written + body_written;
+
+	bool more = s->avail_in > 0 || s->avail_out == 0 ||
+		    s->internal_state.tmp_out_start != s->internal_state.tmp_out_end;
+	if (mode == 1 || mode == 2)
+		more = more || s->internal_state.state != ZSTATE_NEW_HDR;
+	else if (mode == 3)
+		more = more || s->internal_state.state != ZSTATE_END;
+
+	/* Borrowed input and output die with the call. */
+	s->next_in = NULL;
+	s->next_out = NULL;
+	w->total_in += consumed;
+	w->total_out += written;
+
+	if (rc == COMP_OK) {
+		if (mode == 3) {
+			if (!more) w->state = GS_FINISHED;
+			else if (w->state == GS_FRESH || w->state == GS_HDR) w->state = GS_OPEN;
+		} else if (mode == 1 || mode == 2) {
+			/* The flush request is submitted once. Later calls only drain
+			 * the pending output; leaving it set would emit a second,
+			 * redundant empty stored block if the buffer filled exactly. */
+			s->flush = NO_FLUSH;
+			if (!more) w->state = GS_FLUSHED;
+			else if (w->state == GS_FRESH || w->state == GS_HDR) w->state = GS_OPEN;
+		} else {
+			w->state = GS_OPEN;
+		}
+	}
+
+	*out_consumed = consumed;
+	*out_written = written;
+	*out_more = more;
+	return rc;
 }

@@ -89,11 +89,11 @@ so the method form works: `c.compress(..)` is `igzip::compress(c, ..)`.
 | `t.counts(h)` / `trainer_of(h)` | copy counts out / back in, 2.5 KB per content type |
 | `gzip(src, level = 1)` | one-shot; declares its own compressor |
 | `err.ok()` → `bool` | whether a call succeeded; a `Status` is not a condition in Goose |
-| `version`, `bound`, `status_name`, `compressor_size`, `trainer_size` | diagnostics |
-| `MAX_INPUT` | the largest input accepted, 0x7FFFFFF0 bytes (igzip's 32-bit lengths) |
+| `version`, `bound`, `status_name`, `compressor_size`, `trainer_size`, `writer_size` | diagnostics |
+| `MAX_INPUT` | the largest input accepted by the one-shot path, 0x7FFFFFF0 bytes (igzip's 32-bit lengths) |
 
-`Wrapper` is `Raw`, `Gzip` or `Zlib`. `Status` is `Ok`, six named failures, and
-`Other`; `status_name` renders them. Nothing aborts on bad input.
+`Wrapper` is `Raw`, `Gzip` or `Zlib`. `Status` is `Ok`, seven named failures,
+and `Other`; `status_name` renders them. Nothing aborts on bad input.
 
 A `Status` is not a condition — Goose takes a `bool` or an optional — so the
 common case is `guard err.ok() else { ... }`, and a specific failure is
@@ -111,6 +111,100 @@ var out: u8[>..] = [];                 // or you own the buffer and reuse it
 c.compress(body_a, out);
 c.compress(body_b, out);               // two members, back to back
 ```
+
+## Streaming
+
+A `Writer` is the stateful half: it keeps one deflate stream open across calls,
+so a body can be compressed as it is produced. It is a separate type rather
+than a mode on `Compressor`, so a stateless user does not pay for the stream or
+its 64 KiB staging buffer. `Writer` is 367,280 bytes — one per thread, like a
+compressor.
+
+| | |
+|---|---|
+| `gzip_writer(level = 1)` | also `zlib_writer`, `raw_writer`, `writer(wrap, level)` |
+| `w.write(src, out)` → `Status` | append the compressed bytes for `src`; consumes all of it |
+| `w.flush(out)` / `w.flush(mode, out)` → `Status` | `Sync` (default) or `Full` decode point |
+| `w.finish(out)` → `Status` | final block and trailer; the writer is then `Finished` |
+| `w.reset()` → `Status` | back to `Fresh`, keeping wrapper, base level and trained table |
+| `w.write_gzip_header(hdr, out)` / `w.write_zlib_header(hdr, out)` | custom header before the first body byte |
+| `w.set_dict(dict)` → `Status` | preset dictionary, raw and zlib only |
+| `w.set_tables(t)` / `w.clear_tables()` → `Status` | attach (pins level 0) / drop a trained table |
+| `w.write_windowed(src, out, step)` | `write` with an explicit input window; `write` uses `MAX_IN_STEP` |
+| `w.total_in`, `w.total_out`, `w.state` | bytes consumed, bytes produced, lifecycle state |
+
+```goose
+var w = igzip::gzip_writer(1);
+var out: u8[>..] = [];
+
+guard w.write(chunk_a, out).ok() else { abort("write failed"); };
+guard w.flush(out).ok() else { abort("flush failed"); };   // Sync: a decode point
+guard w.write(chunk_b, out).ok() else { abort("write failed"); };
+guard w.finish(out).ok() else { abort("finish failed"); };
+
+w.reset();                                                // next response
+```
+
+`finish` writes the trailer automatically. A `Writer` stages igzip's output
+through its own 64 KiB chunk and appends only the bytes produced, so callers
+never loop over `avail_out`. `write` splits inputs above 2 GiB into windows and
+consumes all of them; `MAX_INPUT` no longer applies to a whole stream.
+
+The lifecycle is `Fresh → HeaderWritten → Open → Flushed → Finished`, with
+`reset` returning to `Fresh`. Writing after `finish`, writing a header after the
+first body byte, or swapping a table while a block is open returns
+`Status.BadState` rather than silently resetting or corrupting the stream.
+
+A fixed-size Goose value can be copied by assignment. A C pointer into the
+original `level_buf` or table would then be shared, so the shim records the
+writer's address and rejects a copy made after the writer has been initialized
+(write, header, `set_dict` or `set_tables`) with `BadState`; `reset` makes the
+copy independent.
+
+### Headers
+
+`GzipHeader` and `ZlibHeader` are written explicitly, before the first `write`,
+`flush` or `finish`:
+
+```goose
+var w = igzip::gzip_writer(1);
+var out: u8[>..] = [];
+let hdr = igzip::GzipHeader { os: 3, name: "report.csv", mtime: 0 };
+guard w.write_gzip_header(hdr, out).ok() else { abort("header failed"); };
+guard w.write(body, out).ok() else { abort("write failed"); };
+guard w.finish(out).ok() else { abort("finish failed"); };
+```
+
+`mtime` defaults to 0 and `os` to 0xff, so a header left alone is reproducible.
+RFC 1952 wants `name` and `comment` NUL-terminated; the wrapper adds the
+terminator, and rejects an interior NUL or an `extra` field longer than 65,535
+bytes with `Status.BadHeader`. A header larger than the 64 KiB chunk still
+works: it is built in a temporary of the required size and appended.
+
+```goose
+var wz = igzip::zlib_writer(1);
+guard wz.set_dict(dictionary).ok() else { abort("dictionary failed"); };
+guard wz.write(payload, out).ok() else { abort("write failed"); };
+guard wz.finish(out).ok() else { abort("finish failed"); };
+```
+
+A zlib stream with a dictionary advertises FDICT and DICTID automatically.
+igzip's plain `IGZIP_ZLIB` header does not, and a standard decoder would reject
+the stream, so the shim emits the six-byte header itself. Calling
+`write_zlib_header` after `set_dict` also forces the flag; an explicit mismatch
+is `BadHeader`. gzip has no preset-dictionary header, so `set_dict` on a gzip
+writer is `BadState`. igzip copies at most the last 32 KiB of the dictionary
+into its own history buffer, so the slice need not outlive the call.
+
+`set_tables` has the same level-0 rule as `Compressor`: a supplied table is
+used only at level 0, so attaching one pins the level. It is legal before the
+first byte and after a completed `Sync` or `Full` flush. `reset` keeps the
+table; `clear_tables` returns to the writer's base level.
+
+One ISA-L quirk: at level 0 the stateful path ends a stream one stored byte
+differently from the stateless path. Levels 1-3 are byte-identical to
+`compressed`; level 0 emits a valid stream of its own. The tests decode it
+rather than asserting byte identity.
 
 ## Training a table
 
@@ -186,22 +280,47 @@ Goose-side (`test/contract.goose`):
 - Counts exported and re-imported produce a bit-identical table.
 - Empty input yields a well-formed 20-byte member.
 
-Independent decode (`scripts/check_gzip.py`): **25 streams** are inflated with
+Streaming (`test/streaming.goose`):
+
+- A single `write` + `finish` matches `compressed` byte for byte at levels 1-3
+  for every wrapper, at 32 KiB through 316 KiB; level 0 is decoded, not
+  compared, for the ISA-L reason above.
+- Chunked writes (1, 7, 63, 4,096 and 70,000 bytes) produce the same bytes as
+  one write at 120,233 bytes, and 1 MiB written in 64 KiB windows matches.
+- `Sync` prefixes decode to exactly the bytes written before the flush; the raw
+  bytes after a `Full` flush decode as the following chunk with a fresh decoder.
+- Custom gzip headers carry mtime, OS, text/xflags, name, comment, extra and
+  HCRC; a 67 KB header exercises the large-header path; interior NULs and
+  oversized extra fields are rejected.
+- zlib window/FLEVEL are honored; preset dictionaries work for raw and zlib,
+  and a zlib stream without the dictionary fails to decode.
+- Trained tables are used at level 0; `reset` keeps one, `clear_tables` drops it.
+- Lifecycle misuse, mid-stream table changes, copies made after the first write,
+  and reset recovery all return the documented `Status`.
+- `test/large_stream.goose` feeds one writer 4.2 GiB in 1 MiB pieces, checks the
+  64-bit total and the wrapped 32-bit gzip ISIZE, and never holds the stream.
+
+Independent decode (`scripts/check_gzip.py`): **40 streams** are inflated with
 CPython's zlib and compared byte for byte — one per wrapper and level, sizes of
 0, 1, 17, 65535, 65536 and 262144 bytes (deflate's block seams), two
 deterministic repeats, two concatenated members, incompressible noise, the
-trained stream, the trained-on-half stream, and the empty member. It also
-checks `mtime = 0` on every gzip member and that our sizes are not far off
-zlib's own.
+trained stream, the trained-on-half stream, the empty member, the streaming
+chunked/default/level-0 streams, both flush points, the trained-table flush swap, the custom and large
+headers, the zlib header, and the dictionary streams with their `zdict`. It
+also checks `mtime = 0` where the API promises it, parses header fields, and
+checks FDICT/DICTID.
 
 Memory safety (`make stress`): `scripts/bound_stress.c` allocates `bound(n)`
 *exactly* and compresses incompressible and adversarial inputs at every level
-and wrapper under AddressSanitizer — 480 cases, up to 4 MiB, no overrun. That is
-what makes the bound trustworthy rather than hopeful.
+and wrapper under AddressSanitizer, then drives the stateful path with output
+slices as small as 8 bytes and writes gzip headers into exact-size and
+one-byte-short buffers — 600 cases, up to 4 MiB, no overrun. That is what makes
+the bound and `avail_out` trustworthy rather than hopeful.
 
 Threading (`test/threads.goose`): four `thread_fn` workers, each with its own
-compressor, 16 jobs through typed queues, and two workers compressing the same
-input must agree on the size.
+compressor, 16 jobs through typed queues, plus two streaming workers with a
+`Writer` on the data stack; two workers compressing the same input must agree
+on the size.
 
 ```
 [ok]   determinism           two runs gave identical bytes
@@ -212,8 +331,9 @@ input must agree on the size.
 [ok]   matrix/gzip_3.gz          1887 bytes    6.0% of 31364
 [ok]   trained.gz                2135 bytes    6.8% of 31364
 [ok]   trained table saves 960 bytes over the level 0 default
-25/25 streams valid
+40/40 streams valid
 4 workers, 16 jobs, 2977 bytes for 425 records
+4200 MiB, ISIZE 109051904, total_in 4404019200
 ```
 
 ## Layout
@@ -224,8 +344,10 @@ igzip.build              native part: names the CMake target "igzip_goose"
 CMakeLists.txt          builds the shim and ISA-L from vendor/isa-l
 vendor/isa-l            pinned submodule, v2.32.1 (not installed anywhere)
 src/igzip_shim.c         the C side; owns no memory
-test/contract.goose     contract tests, writes build/tmp for the checker
+test/contract.goose     one-shot contract tests, writes build/tmp for the checker
+test/streaming.goose    writer, flush, header, dictionary and lifecycle tests
 test/threads.goose      one compressor per worker thread (built, not JIT-run)
+test/large_stream.goose >2 GiB and >4 GiB through one writer (built, not JIT-run)
 examples/               gzip_file, trained_table, bench
 scripts/check_gzip.py   inflates every stream the tests wrote
 scripts/bound_stress.c  proves the output bound as an exact buffer size
