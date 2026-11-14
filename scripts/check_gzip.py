@@ -3,10 +3,12 @@
 
 A compressor that returns Ok with a plausible size can still emit a broken
 stream, so the Goose assertions are not enough on their own. This runs an
-independent decoder (CPython's zlib) over each artifact `test/contract.goose`
-produced: one stream per wrapper and level, the sizes that sit on deflate's
-block boundaries, incompressible input, concatenated members, the trained
-stream, and the empty input.
+independent decoder (CPython's zlib) over each artifact `test/contract.goose`,
+`test/writer_contract.goose` and `test/streaming.goose` produced: one stream
+per wrapper and level, the sizes that sit on deflate's block boundaries,
+incompressible input, concatenated members, the trained stream, the empty
+input, custom headers, flush points, preset dictionaries and the stateful
+level-0 stream.
 
 Artifacts are discovered, not listed, so adding a case on the Goose side needs
 no change here.
@@ -17,6 +19,7 @@ no change here.
 from __future__ import annotations
 
 import gzip
+import struct
 import sys
 import zlib
 from pathlib import Path
@@ -31,7 +34,7 @@ NAMED = {
     "trained.gz": 1,
     "empty.gz": 0,
 }
-EXPECTED_STREAMS = 25
+EXPECTED_STREAMS = 43
 
 
 def inflate(data: bytes, kind: str) -> bytes:
@@ -53,7 +56,31 @@ class Checker:
         print(f"[FAIL] {what}: {why}")
         self.failures += 1
 
-    def check(self, rel: str, kind: str, want: bytes) -> None:
+    def check_with_zdict(self, rel: str, kind: str, want: bytes, zdict: bytes) -> None:
+        path = self.root / rel
+        if not path.exists():
+            self.fail(rel, "missing")
+            return
+        raw = path.read_bytes()
+        try:
+            wbits = 15 if kind == "zlib" else -15
+            d = zlib.decompressobj(wbits, zdict=zdict)
+            got = d.decompress(raw) + d.flush()
+        except Exception as exc:  # noqa: BLE001
+            self.fail(rel, str(exc))
+            return
+        if got != want:
+            self.fail(rel, f"inflated {len(got)} bytes, expected {len(want)}")
+            return
+        try:
+            zlib.decompress(raw, 15 if kind == "zlib" else -15)
+            self.fail(rel, "decoded without the dictionary, so FDICT is not set")
+        except zlib.error:
+            pass
+        self.checked += 1
+        self.sizes[rel] = len(raw)
+
+    def check(self, rel: str, kind: str, want: bytes, mtime_zero: bool = True) -> None:
         path = self.root / rel
         if not path.exists():
             self.fail(rel, "missing")
@@ -71,7 +98,7 @@ class Checker:
             if raw[:2] != b"\x1f\x8b" or raw[2] != 8:
                 self.fail(rel, "not a gzip member")
                 return
-            if raw[4:8] != b"\x00\x00\x00\x00":
+            if mtime_zero and raw[4:8] != b"\x00\x00\x00\x00":
                 self.fail(rel, "mtime is not zero, so output is not reproducible")
                 return
         self.checked += 1
@@ -146,6 +173,138 @@ def main() -> int:
             c.fail("trained.gz", "did not beat the level 0 default table")
         else:
             print(f"[ok]   trained table saves {saved} bytes over the level 0 default")
+
+    # ---- 0.2.0 streaming artifacts -------------------------------------
+    stream = root / "stream"
+    sbody_path = stream / "body.txt"
+    if not sbody_path.exists():
+        print(f"error: {sbody_path} missing; run test/streaming.goose first", file=sys.stderr)
+        return 2
+    sbody = sbody_path.read_bytes()
+    flush_a = (stream / "flush_a.bin").read_bytes()
+    flush_b = (stream / "flush_b.bin").read_bytes()
+    zdict = (stream / "dict.bin").read_bytes()
+
+    c.check("stream/default.gz", "gzip", sbody)
+    c.check("stream/chunked.gz", "gzip", sbody)
+    c.check("stream/level0.gz", "gzip", sbody)
+    c.check("stream/trained.gz", "gzip", sbody)
+    c.check("stream/trained_swap.gz", "gzip", sbody)
+    c.check("stream/sync_full.gz", "gzip", flush_a + flush_b)
+    c.check("stream/full_full.gz", "gzip", flush_a + flush_b)
+    c.check("stream/custom_header.gz", "gzip", sbody, mtime_zero=False)
+    c.check("stream/large_header.gz", "gzip", sbody, mtime_zero=False)
+    c.check("stream/zlib_header.zlib", "zlib", sbody)
+    c.check("stream/zlib_window8.zlib", "zlib", sbody)
+    c.check_with_zdict("stream/dict_zlib.zlib", "zlib", sbody, zdict)
+    c.check_with_zdict("stream/dict_zlib_explicit.zlib", "zlib", sbody, zdict)
+    c.check_with_zdict("stream/dict_raw.deflate", "deflate", sbody, zdict)
+    c.check("stream/full_tail.deflate", "deflate", flush_b)
+    sync_big = (stream / "sync_big.bin").read_bytes()
+    c.check("stream/sync_big.gz", "gzip", sync_big * 2)
+    c.check("stream/sync_twice.gz", "gzip", flush_a)
+    medium = (stream / "medium.bin").read_bytes()
+    c.check("stream/medium.gz", "gzip", medium)
+
+    # A Sync flush is a decode point: the prefix decodes to A on its own.
+    prefix = (stream / "sync_prefix.gz").read_bytes()
+    d = zlib.decompressobj(31)
+    got = d.decompress(prefix)
+    if got != flush_a:
+        c.fail("stream/sync_prefix.gz", f"decoded {len(got)} bytes, expected {len(flush_a)}")
+    else:
+        print("[ok]   sync prefix            decodes to the first chunk")
+
+    # Custom gzip header fields, parsed from the bytes rather than trusted.
+    raw = (stream / "custom_header.gz").read_bytes()
+    if raw[:3] != b"\x1f\x8b\x08":
+        c.fail("stream/custom_header.gz", "not a gzip member")
+    else:
+        flags = raw[3]
+        mtime = struct.unpack("<I", raw[4:8])[0]
+        xfl, osbyte = raw[8], raw[9]
+        pos = 10
+        extra = b""
+        name = b""
+        comment = b""
+        if flags & 4:
+            xlen = struct.unpack("<H", raw[pos : pos + 2])[0]
+            pos += 2
+            extra = raw[pos : pos + xlen]
+            pos += xlen
+        if flags & 8:
+            end = raw.index(b"\x00", pos)
+            name = raw[pos:end]
+            pos = end + 1
+        if flags & 16:
+            end = raw.index(b"\x00", pos)
+            comment = raw[pos:end]
+            pos = end + 1
+        if (
+            flags != 0x1F
+            or mtime != 123456789
+            or xfl != 2
+            or osbyte != 3
+            or name != b"report.csv"
+            or comment != b"built by goose"
+            or extra != b"\x01\x02\x03"
+        ):
+            c.fail("stream/custom_header.gz", "custom header fields do not match")
+        else:
+            print("[ok]   custom gzip header      mtime/os/name/comment/extra/hcrc")
+
+    # A header larger than the 64 KiB chunk must still parse and decode.
+    raw = (stream / "large_header.gz").read_bytes()
+    if len(raw) <= 65536:
+        c.fail("stream/large_header.gz", "large-header fallback did not run")
+    else:
+        flags = raw[3]
+        xlen = struct.unpack("<H", raw[10:12])[0] if flags & 4 else 0
+        if xlen != 65000:
+            c.fail("stream/large_header.gz", f"XLEN {xlen}, expected 65000")
+        else:
+            print(f"[ok]   large gzip header       {len(raw)} bytes, XLEN {xlen}")
+
+    # The zlib header carries the requested window and FLEVEL.
+    raw = (stream / "zlib_header.zlib").read_bytes()
+    cmf, flg = raw[0], raw[1]
+    window = (cmf >> 4) + 8
+    flevel = flg >> 6
+    if window != 12 or flevel != 2 or ((cmf << 8) + flg) % 31 != 0:
+        c.fail("stream/zlib_header.zlib", f"window {window}, flevel {flevel}, bad check bits")
+    else:
+        # A strict decoder uses the CMF window, not 15: the deflate stream must
+        # not reference distances outside the window it advertised.
+        try:
+            d = zlib.decompressobj(window)
+            got = d.decompress(raw) + d.flush()
+            if got != sbody:
+                c.fail("stream/zlib_header.zlib", "strict-window decode produced different bytes")
+            else:
+                print(f"[ok]   zlib header              window {window}, FLEVEL {flevel}, strict decode")
+        except Exception as exc:  # noqa: BLE001
+            c.fail("stream/zlib_header.zlib", f"strict-window decode: {exc}")
+
+    raw8 = (stream / "zlib_window8.zlib").read_bytes()
+    window8 = (raw8[0] >> 4) + 8
+    try:
+        d = zlib.decompressobj(window8)
+        got = d.decompress(raw8) + d.flush()
+        if got != sbody:
+            c.fail("stream/zlib_window8.zlib", "strict-window decode produced different bytes")
+        else:
+            print(f"[ok]   zlib window {window8}           strict decode")
+    except Exception as exc:  # noqa: BLE001
+        c.fail("stream/zlib_window8.zlib", f"strict-window decode: {exc}")
+
+    for rel in ["stream/dict_zlib.zlib", "stream/dict_zlib_explicit.zlib"]:
+        raw = (root / rel).read_bytes()
+        fdict = (raw[1] >> 5) & 1
+        dict_id = struct.unpack(">I", raw[2:6])[0] if fdict else 0
+        if fdict != 1 or dict_id != zlib.adler32(zdict):
+            c.fail(rel, "FDICT/DICTID do not match the dictionary")
+        else:
+            print(f"[ok]   {rel:<32} FDICT set")
 
     for rel in ["matrix/gzip_0.gz", "matrix/gzip_1.gz", "matrix/gzip_3.gz", "trained.gz"]:
         if rel in c.sizes:

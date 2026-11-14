@@ -24,11 +24,14 @@ endif
 
 ENTRY    := igzip.goose
 EXAMPLES := $(sort $(wildcard examples/*.goose))
-# Threading cannot run under the JIT, so it is built and run separately.
-JIT_TESTS   := $(filter-out test/threads.goose,$(sort $(wildcard test/*.goose)))
+# Threading cannot run under the JIT, so it is built and run separately. The
+# large-input test is native too: it feeds a Writer past 4 GiB, and is kept out
+# of the JIT loop to keep `make test` quick.
+JIT_TESTS   := $(filter-out test/threads.goose test/large_stream.goose,$(sort $(wildcard test/*.goose)))
 THREAD_TEST := test/threads.goose
+LARGE_TEST  := test/large_stream.goose
 
-.PHONY: all check test test-threads examples bench stress fmt fmt-check verify tools submodule clean
+.PHONY: all check test test-threads test-large examples bench stress fmt fmt-check verify tools submodule clean
 
 all: check
 
@@ -60,6 +63,14 @@ test-threads: submodule
 	@$(GOOSE) build $(THREAD_TEST) -o build/threads_test
 	@./build/threads_test
 
+# Past MAX_INPUT and past the 32-bit gzip ISIZE wrap, without holding the
+# uncompressed stream.
+test-large: submodule
+	@mkdir -p build
+	@echo "== $(LARGE_TEST)"
+	@$(GOOSE) build $(LARGE_TEST) -o build/large_stream
+	@./build/large_stream
+
 examples: check
 	@for f in $(EXAMPLES); do echo "== $$f"; $(GOOSE) check "$$f" || exit 1; done
 
@@ -79,7 +90,7 @@ bench: check
 	@$(GOOSE) build examples/bench.goose -o build/bench
 	@./build/bench
 
-verify: check test test-threads examples
+verify: check test test-threads test-large examples
 	@echo "verify: ok"
 
 fmt:

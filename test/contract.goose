@@ -11,44 +11,13 @@
 import std;
 import os;
 import igzip from "..";
+import support from "./support";
 
 let TMP = "build/tmp";
 // The release pinned in vendor/isa-l. Bumping it is a deliberate edit here.
 let EXPECTED_ISA_L = "2.32.1";
 let COMPRESSOR_BYTES = 37434 * 8;
 let TRAINER_BYTES = 2364 * 8;
-
-// A skewed JSON corpus: one schema, many records, the shape an API server
-// actually compresses.
-fn corpus(out: u8[>..]&) {
-    for i in 300 {
-        format(out, "{\"id\":", i, ",\"user\":\"alice\",\"email\":\"alice@example.com\",",
-               "\"active\":true,\"score\":", i * 37 % 1000, ",\"tags\":[\"alpha\",\"beta\"]},\n");
-    }
-}
-
-// A compressible body of exactly n bytes, cut from the corpus's pattern.
-fn body_of(out: u8[>..]&, n: i64) {
-    var id = 0;
-    while out.len < n {
-        format(out, "{\"id\":", id, ",\"user\":\"alice\",\"email\":\"alice@example.com\",",
-               "\"active\":true,\"score\":", id * 37 % 1000, "},\n");
-        id++;
-    }
-    out.resize(n);
-}
-
-// Bytes nothing can compress: xorshift64. This is what exercises the worst-case
-// expansion path, the one that overran a small buffer in igzip.
-fn noise(out: u8[>..]&, n: i64) {
-    var x: u64 = 0x243F6A8885A308D3;
-    for i in n {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        out.push((x & 0xff) as! u8);
-    }
-}
 
 fn ext_of(w: igzip::Wrapper) -> const u8[:] {
     return match w {
@@ -70,14 +39,6 @@ fn gz1(body: const u8[:]) -> i64 {
     let gz, err = igzip::gzip(body);
     assert(err == igzip::Status.Ok);
     return gz.len;
-}
-
-fn same(a: const u8[:], b: const u8[:]) -> bool {
-    guard a.len == b.len else { return false; }
-    for x, i in a {
-        if x != b[i] { return false; }
-    }
-    return true;
 }
 
 // The C structs and the declarations in igzip.goose must agree, or C writes past
@@ -130,12 +91,12 @@ fn test_determinism(body: const u8[:]) {
     let a, err_a = c.compressed(body);
     let b, err_b = c.compressed(body);
     assert(err_a == igzip::Status.Ok && err_b == igzip::Status.Ok);
-    assert(same(a, b));
+    assert(support::same(a, b));
 
     var c2 = igzip::gzip_compressor(1);
     let d, err_d = c2.compressed(body);
     assert(err_d == igzip::Status.Ok);
-    assert(same(a, d));
+    assert(support::same(a, d));
 }
 
 // Two compressors hold independent state, so one per worker thread is safe.
@@ -185,7 +146,7 @@ fn test_sizes() {
     for k in 6 {
         let n = sizes[k];
         var body: u8[>..] = [];
-        body_of(body, n);
+        support::body_of(body, n);
         assert(body.len == n);
 
         var c = igzip::gzip_compressor(1);
@@ -201,7 +162,7 @@ fn test_sizes() {
 // and must stay inside the bound it advertises.
 fn test_incompressible() {
     var noise_bytes: u8[>..] = [];
-    noise(noise_bytes, 65536);
+    support::noise(noise_bytes, 65536);
 
     for level in 4 {
         var c = igzip::gzip_compressor(level as i32);
@@ -382,7 +343,7 @@ fn write_artifacts(body: const u8[:]) {
     for k in 6 {
         let n = sizes[k];
         var src: u8[>..] = [];
-        body_of(src, n);
+        support::body_of(src, n);
         var c = igzip::gzip_compressor(1);
         let out, err = c.compressed(src);
         assert(err == igzip::Status.Ok);
@@ -392,7 +353,7 @@ fn write_artifacts(body: const u8[:]) {
 
     // Incompressible input, to prove the expansion path inflates too.
     var noise_bytes: u8[>..] = [];
-    noise(noise_bytes, 65536);
+    support::noise(noise_bytes, 65536);
     var cn = igzip::gzip_compressor(1);
     let noisy, err_n = cn.compressed(noise_bytes);
     assert(err_n == igzip::Status.Ok);
@@ -435,7 +396,7 @@ fn write_artifacts(body: const u8[:]) {
 
 fn main() {
     var body: u8[>..] = [];
-    corpus(body);
+    support::corpus(body, 300);
     assert(body.len > 20000);
 
     test_layout();
