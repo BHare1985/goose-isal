@@ -68,6 +68,8 @@ separate `Writer` (367,280 B), not a mode on `Compressor`:
 
 ## 0.3.0 — inflate
 
+**Design brief: [docs/design/0.3.0.md](docs/design/0.3.0.md).**
+
 The other half of the codec, and the point at which the package can test itself
 instead of leaning on a Python decoder.
 
