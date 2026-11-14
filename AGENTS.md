@@ -6,6 +6,36 @@ behaviours the API encodes, the security notes, and the FFI review gates — is 
 **[docs/internals.md](docs/internals.md)**. Read it before changing
 `src/igzip_shim.c` or `igzip.goose`.
 
+## Layout
+
+| Path | What it is |
+|---|---|
+| `igzip.goose` | The package and only root file: `namespace igzip`, the public API, `extern fn` declarations |
+| `src/igzip_shim.c` | The C adapter and only FFI boundary; owns no memory |
+| `igzip.build` | `.build` sidecar: CMake target `igzip_goose`, directories that are not modules |
+| `CMakeLists.txt` | Builds the shim and ISA-L from `vendor/isa-l` (pinned submodule) |
+| `test/*.goose` | Root files that assert and export gzip artifacts for `scripts/check_gzip.py` |
+| `examples/*.goose` | Runnable root programs: bench, gzip_file, trained_table |
+| `scripts/`, `docs/` | Verification scripts and maintainer docs |
+
+## Commands
+
+| Command | Meaning |
+|---|---|
+| `make check` | `goose check igzip.goose`; typecheck only, silent on success |
+| `goose run test/contract.goose --debug` | JIT; no C compiler needed |
+| `goose build test/threads.goose -o build/threads_test` | native build; threads require it |
+| `goose fetch igzip.goose` | fetch declared packages (none today) |
+| `goose format igzip.goose test examples` | rewrite in Goose layout |
+| `make verify` | check + JIT tests + thread test + examples |
+
+## Goose code
+
+Load the `goose-lang` skill (`.pi/skills/goose-lang/SKILL.md`) before writing or
+refactoring non-trivial Goose. It carries the language reference, diagnostics,
+and verified samples. Never assume Rust, C++ or Zig syntax or heap allocation:
+Goose has no heap, no GC and no lifetime annotations.
+
 Four rules, in short:
 
 1. **C owns no memory.** State lives in Goose values; no `malloc`, no handle to
