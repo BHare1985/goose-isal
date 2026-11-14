@@ -63,12 +63,16 @@ let STREAM_WORKERS = 2;
 let STREAM_JOBS = 6;
 let ROUND_JOBS = 4;
 
+// One JSON record, appended: the unit both the main thread and the reader
+// worker build their bodies from.
+fn make_record(out: u8[>..]&, i: i32) {
+    format(out, "{\"id\":", i, ",\"user\":\"alice\",\"email\":\"alice@example.com\",",
+           "\"active\":true,\"score\":", i * 37 % 1000, ",\"tags\":[\"alpha\",\"beta\"]},\n");
+}
+
 // One JSON schema, N records: the body a worker compresses.
 fn make_body(out: u8[>..]&, records: i32) {
-    for i in records {
-        format(out, "{\"id\":", i, ",\"user\":\"alice\",\"email\":\"alice@example.com\",",
-               "\"active\":true,\"score\":", i * 37 % 1000, ",\"tags\":[\"alpha\",\"beta\"]},\n");
-    }
+    for i in records { make_record(out, i); }
 }
 
 thread_fn worker() {
@@ -273,31 +277,36 @@ fn main() {
     for i in STREAM_WORKERS { qput(StreamJob { records: -1 }); }
 
     // Members compressed on this thread, to be decoded by a worker thread.
+    //
+    // The body for N records is a prefix of the body for more, so the largest
+    // is built once and sliced. That is not only natural -- it is the only
+    // shape that works on windows-x64: Goose v2026.4's MSVC output miscompiles
+    // a second write into a growable buffer in the main program, leaving
+    // fragments of the literals at the wrong offsets and zeros in the holes
+    // (docs/internals.md, ROADMAP.md). One generation, written from an empty
+    // buffer, is correct on every target, and the worker still regenerates
+    // each body from scratch, so a wrong body cannot pass unnoticed.
+    var body: u8[>..]  = [];
+    var ends: i64[>..] = [];
+    for i in 100 + (ROUND_JOBS - 1) * 75 {
+        make_record(body, i as i32);
+        ends.push(body.len);
+    }
+
     var w = igzip::gzip_writer(1);
-    var member:  u8[>..] = [];
-    var body:    u8[>..] = [];
-    var scratch: u8[>..] = [];
+    var member: u8[>..] = [];
     for i in ROUND_JOBS {
         let records = 100 + i * 75;
-        body.clear();
-        make_body(body, records as i32);
-        let gen = checksum(body);
-        // A second generation and a checksum after the write bracket the two
-        // things that can touch this buffer: make_body, and the Writer.
-        scratch.clear();
-        make_body(scratch, records as i32);
-        let gen2 = checksum(scratch);
+        let prefix = ends[records - 1];
         member.clear();
-        assert(w.write(body, member));
+        assert(w.write(body[..prefix], member));
         assert(w.finish(member));
         assert(w.reset());
-        let post = checksum(body);
-        print("main body ", records, ": gen=", gen, " gen2=", gen2, " post=", post);
         assert(member.len <= BOX);
         var box = RoundBox {
             records: records as i32,
             len:     member.len as i32,
-            sum:     gen,
+            sum:     checksum(body[..prefix]),
             ..
         };
         box.data[..member.len].move_from(member[..]);
