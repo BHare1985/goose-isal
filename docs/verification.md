@@ -32,7 +32,7 @@ FDICT/DICTID and matching/mismatched IDs; trained tables, mid-flush swaps and
 `clear_tables`. Every custom-header stream is decoded back to the same body.
 
 **`test/inflate_contract.goose`** — the reader's state machine, cell by cell
-against the matrix in [design/0.3.0.md](design/0.3.0.md) §5 Q11; a terminal error
+against the matrix in [internals.md](internals.md); a terminal error
 latching; the copy guard and its recovery; `Truncated` from `finish`, from
 `inflated("")` and from `inflate`; `TooSmall` at the exact size, one byte short and
 a zero-length destination, and a clean reader after it; `NeedDict` and the resume

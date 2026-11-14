@@ -229,13 +229,26 @@ appended. `Writer` and `Reader` share the lazy-init plus `pinned_self` copy
 guard, and each family of C statuses has its own range — the deflate family at
 `-8`/`-10`, inflate at `-11..-15` — so `status_of` stays one table.
 
-The reader's phase rules are the part of 0.3 a caller can get wrong, so they are
-a matrix in [design/0.3.0.md](design/0.3.0.md) §5 Q11 and asserted cell by cell
-in `test/inflate_contract.goose`. Two rules hold it together: `read` never ends
-a body (a member boundary is `finished(r)`, not a state change, so a caller that
-stops feeding can resume), and a terminal error latches the Reader `Finished`,
-because `isal_inflate` would otherwise answer `Ok` forever from a `FINISH` block
-state.
+The reader's phase rules are the part of the API a caller can get wrong, so
+they are written down here and asserted cell by cell in
+`test/inflate_contract.goose`:
+
+| verb | `Fresh` | `Open` | `Finished` |
+|---|---|---|---|
+| `read` | `Ok`, to `Open` | `Ok`; **stays `Open` when `finished(r)` becomes true** | `BadState` |
+| `finish` | `Truncated`, to `Finished` | `finished(r)` ? `Ok` : `Truncated`, to `Finished` | `BadState` |
+| `reset` | `Ok`, stays `Fresh` | `Ok`, to `Fresh` | `Ok`, to `Fresh` |
+| `set_dict` | `Ok` if raw/zlib, sets `has_dict` | `Ok` only where igzip allows (immediately after `NeedDict`), else `BadState` from igzip's own guard | `BadState` |
+| `inflate` | `Ok` to `Finished`; `TooSmall` stays `Fresh`; any other status to `Finished` | `BadState` | `BadState` |
+| `inflated` | `Finished` | `BadState` | `BadState` |
+| `finished`, `total_in`, `total_out`, `reader_size` | any | any | any |
+
+Two rules hold it together: `read` never ends a body (a member boundary is
+`finished(r)`, not a state change, so a caller that stops feeding can resume),
+and a terminal error latches the Reader `Finished`, because `isal_inflate` would
+otherwise answer `Ok` forever from a `FINISH` block state. `NeedDict` is the one
+status that does not latch: it is a request, and the next call is `set_dict` then
+`read`, both still `Open`.
 
 The zlib `window_bits` field is not cosmetic: the shim also sets
 `stream.hist_bits` to the same value before deflating. A 4 KiB window on the

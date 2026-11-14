@@ -40,6 +40,10 @@ there is no bound to give: a negative length, or one so large that the bound
 would not fit igzip's 32-bit lengths. Decompression has no bound, which is what
 `inflate` and `TooSmall` exist for.
 
+Chunking is not part of the format. How a body is split across `write` calls can
+change which block boundaries igzip picks, so two chunkings can yield different
+but equally valid bytes; compare decoded output, not compressed bytes.
+
 ## Streaming compression
 
 ```goose

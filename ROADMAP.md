@@ -48,8 +48,6 @@ No new API; what real traffic finds.
 
 ## Shipped: 0.2.0 — streaming deflate and gzip header control
 
-**Design brief: [docs/design/0.2.0.md](docs/design/0.2.0.md).**
-
 For bodies produced in pieces, and for byte-identical repeats. The result is a
 separate `Writer` (367,280 B), not a mode on `Compressor`:
 
@@ -68,8 +66,6 @@ separate `Writer` (367,280 B), not a mode on `Compressor`:
   `test/support/` for shared generators; 43 streams are independently decoded.
 
 ## Shipped: 0.3.0 — the complete codec
-
-**Design brief: [docs/design/0.3.0.md](docs/design/0.3.0.md).**
 
 Inflate, which is the other half of the codec, and header reading, which closes
 the last capability gap against `igzip_lib.h`. With this release a caller can do

@@ -276,7 +276,6 @@ that allocate every buffer to its exact size.
 | [docs/coverage.md](docs/coverage.md) | what `igzip` exposes and what this package does with it — including what is deliberately left out |
 | [docs/verification.md](docs/verification.md) | what `make verify` proves, file by file |
 | [docs/internals.md](docs/internals.md) | maintaining it: the pin, the memory model, the igzip behaviours the API encodes, the FFI gates |
-| [docs/design/](docs/design/) | the design briefs, with the measurements behind each decision |
 | [ROADMAP.md](ROADMAP.md) · [CHANGELOG.md](CHANGELOG.md) | where it is going, and what each release added |
 
 ## Examples
