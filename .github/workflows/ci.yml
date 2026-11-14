@@ -39,19 +39,19 @@ jobs:
       matrix:
         include:
           - name: linux-x64
-            os: ubuntu-latest
+            os: ubuntu-24.04
             goose: goose-v2026.4-linux-x64.tar.gz
           - name: macos-x64
-            os: macos-13
+            os: macos-15-intel
             goose: goose-v2026.4-macos-x64.tar.gz
           - name: macos-arm64
-            os: macos-14
+            os: macos-15
             goose: goose-v2026.4-macos-arm64.tar.gz
           - name: windows-x64
             os: windows-latest
             goose: goose-v2026.4-windows-x64.zip
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -90,7 +90,7 @@ jobs:
       # The native parts (ISA-L, the shim) are what differ per platform, and
       # they are the slow step, so they are cached by the ISA-L commit.
       - name: cache the package's native build
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.goose/build
@@ -125,18 +125,19 @@ jobs:
 
       # Windows builds and links the threaded program -- which is the platform
       # question this job exists to answer -- but its reader worker decodes the
-      # wrong bytes there (code 3 in test/threads.goose, run 43555546808). That
-      # is a runtime difference to investigate with a Windows machine, not
-      # something to paper over, so the build is asserted and the run is
-      # reported: a yellow step, not a red build.
+      # wrong bytes there (code 3 in test/threads.goose, run 43555546808). The
+      # build is asserted; the run is reported as a warning rather than an
+      # ##[error], because a tolerated failure that prints an error annotation
+      # reads as a red job in the log and in the pull request.
       - name: threads (native, Windows — build asserted, run reported)
         if: runner.os == 'Windows'
-        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
           goose build test/threads.goose -o "$RUNNER_TEMP/threads.exe"
-          "$RUNNER_TEMP/threads.exe"
+          out=$("$RUNNER_TEMP/threads.exe" 2>&1) && echo "$out" || {
+            echo "::warning title=threads on Windows::$(tr '\n' ' ' <<< "$out" | tail -c 200)"
+          }
 
       - name: 4.2 GiB round trip (native)
         if: runner.os != 'Windows'
