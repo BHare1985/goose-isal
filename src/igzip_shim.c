@@ -251,7 +251,16 @@ static void bld_claim(gs_rref b, int64_t n) {
  * Nothing else in this file has storage duration, which is what keeps two
  * compressors in two threads independent; a per-thread store does not weaken
  * that. */
-static _Thread_local int32_t gs_last_status = 0;
+/* C11 spells it `_Thread_local`; MSVC's C compiler wants `__declspec(thread)`
+ * and rejects the C11 spelling, so the one piece of thread-local state this
+ * package has is spelled per compiler. */
+#if defined(_MSC_VER)
+#define GS_THREAD_LOCAL __declspec(thread)
+#else
+#define GS_THREAD_LOCAL _Thread_local
+#endif
+
+static GS_THREAD_LOCAL int32_t gs_last_status = 0;
 
 void igzip_gs_record(int32_t rc) { gs_last_status = rc; }
 int32_t igzip_gs_last_status(void) { return gs_last_status; }
