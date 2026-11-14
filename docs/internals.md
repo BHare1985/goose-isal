@@ -288,11 +288,12 @@ checker is the regression test.
   in a temporary of the measured size; `MAX_HEADER` (1 MiB) caps that
   allocation, so an untrusted long name is `BadHeader` rather than an unbounded
   allocation.
-- **igzip does not write through its input pointer.** `isal_deflate_stateless`
-  and `isal_update_histogram` take `uint8_t *`, and the shim passes a
-  `const u8[:]` by casting away const. This was checked in the vendored sources:
-  neither writes through `next_in` / `start_stream`. Re-check if you add a call
-  that takes an input pointer.
+- **igzip does not write through its input pointer.** `isal_deflate_stateless`,
+  `isal_update_histogram` and `isal_create_hufftables` take non-const pointers,
+  and the shim passes a `const u8[:]` or a `const Trainer` by casting away
+  const. This was checked in the vendored sources: none of them writes through
+  `next_in` / `start_stream` / the histogram counts. Re-check if you add a call
+  that takes an input or const pointer.
 - **No globals, no mutable statics** in the shim, which is why two compressors in
   two threads share nothing and `igzip.build` does not declare
   `main_thread_only`. `test/threads.goose` exercises that with four workers.
@@ -380,16 +381,13 @@ server runs; `make check` covers the package and `make test` the tests.
   mistake surfaces later as a nonsense comparison rather than at the binding.
 - A status is out of band: `if !call { ... igzip::error() ... }`, and
   `igzip::status()` narrowed by `if` before a `match`.
-- **A second write into a growable `u8[>..]` in the main program is
-  miscompiled by Goose v2026.4's MSVC output on windows-x64.** The first
-  `format`-driven build of a body from an empty buffer is correct; the second
-  and later ones leave literal fragments at the wrong offsets and zeros in the
-  holes, in a fresh buffer as well, and in the main program only -- the same
-  function in a `thread_fn` produces the right bytes. `test/threads.goose`
-  therefore generates its largest body once and slices prefixes, which is what
-  it would do anyway. If a future test needs repeated generation in the main
-  program on Windows, verify against a checksum first: two bodies that should
-  be equal hashing differently is the signature.
+- **A second format-driven build of a growable buffer in the main program is
+  miscompiled on windows-x64 by Goose v2026.4's MSVC output.** The first build
+  from an empty buffer is correct; later ones leave literal fragments at wrong
+  offsets and NUL holes, in a fresh buffer too, and only in `main` -- the same
+  function in a `thread_fn` is correct. `test/threads.goose` builds its largest
+  body once and slices prefixes. The signature to watch for is two bodies that
+  should be equal hashing differently.
 
 ## Conventions
 

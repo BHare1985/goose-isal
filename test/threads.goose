@@ -242,14 +242,11 @@ fn main() {
 
     // Members compressed on this thread, to be decoded by a worker thread.
     //
-    // The body for N records is a prefix of the body for more, so the largest
-    // is built once and sliced. That is not only natural -- it is the only
-    // shape that works on windows-x64: Goose v2026.4's MSVC output miscompiles
-    // a second write into a growable buffer in the main program, leaving
-    // fragments of the literals at the wrong offsets and zeros in the holes
-    // (docs/internals.md, ROADMAP.md). One generation, written from an empty
-    // buffer, is correct on every target, and the worker still regenerates
-    // each body from scratch, so a wrong body cannot pass unnoticed.
+    // The body for N records is a prefix of the body for N+k, so the largest is
+    // built once and sliced. That is also the only shape that works on
+    // windows-x64 with Goose v2026.4: MSVC miscompiles a second format-driven
+    // build of a growable buffer in the main program (ROADMAP.md). The reader
+    // worker still regenerates each body from scratch, so a wrong body fails.
     var body: u8[>..]  = [];
     var ends: i64[>..] = [];
     for i in 100 + (ROUND_JOBS - 1) * 75 {

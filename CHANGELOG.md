@@ -32,8 +32,17 @@
   true. The record is per thread, so a worker's failure is its own.
 - `Status` implements `format`, so `print(err)` needs no `status_name` call.
 
+- **`bound(n)` returns `0` when there is no bound to give** — a negative length,
+  or one so large that the bound would not fit in the 32 bits igzip's lengths
+  use. It used to clamp to `0x7FFFFFF0`, which for an input of about 2 GiB is a
+  "bound" no larger than the input, and a stored block of incompressible input
+  can overrun that.
+
 ### Internals
 
+- The C boundary refuses a slice whose length is non-zero and whose data pointer
+  is null, at every entry point that dereferences one. Goose cannot build such a
+  value and `from_bytes` rejects one, but the shim is a C API as well.
 - The per-thread status (`_Thread_local` in `src/igzip_shim.c`) is the one piece
   of mutable state in the package, and the one exception to the shim's
   no-statics rule. It is per thread, written by every fallible call and read only

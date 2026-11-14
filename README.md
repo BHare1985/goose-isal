@@ -1,8 +1,14 @@
 # goose-igzip
 
+[![ci](https://github.com/BHare1985/goose-igzip/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/BHare1985/goose-igzip/actions/workflows/ci.yml)
+
 A complete gzip, zlib and raw-deflate codec in [Goose](https://goose-lang.org),
 bound to Intel ISA-L's **igzip**: compress and decompress, streaming or one-shot,
 with trained Huffman tables, custom headers and preset dictionaries.
+
+The current version is **0.4.0**. CI typechecks the package, runs every test, and
+independently decodes the streams it wrote, on all four platforms Goose ships a
+compiler for: linux-x64, macos-x64, macos-arm64 and windows-x64.
 
 Everything a caller touches is a Goose value, so the owning scope is the free —
 no C memory to release and no handle to close. Failures are a typed `Status`, and
@@ -208,7 +214,7 @@ is `igzip::compress(c, ..)`. Full detail, with the reasoning, is in
 | Call | Meaning |
 |---|---|
 | `version(out)` | ISA-L release, read from its headers |
-| `bound(n)` | upper bound on compressed size, for sizing a destination |
+| `bound(n)` | upper bound on compressed size, for sizing a destination; `0` when there is none |
 | `compressor_size()`, `writer_size()`, `reader_size()`, `trainer_size()` | the pinned value sizes |
 | `MAX_INPUT`, `MAX_IN_STEP`, `MAX_HEADER` | the 32-bit input limit, the window size, the header cap |
 
@@ -313,11 +319,11 @@ File-by-file detail, and the ISA-L quirks that shape the results, are in
 ## Importing
 
 ```goose
-import igzip from "BHare1985/goose-igzip@v0.3.0";
+import igzip from "BHare1985/goose-igzip@v0.4.0";
 ```
 
-Goose fetches the repo and its submodule. Until a tag exists, use a commit or a
-local path.
+Goose fetches the repo and its submodule. Before the 0.4.0 tag exists, use a
+commit or a local path.
 
 ## Acknowledgements
 

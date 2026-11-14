@@ -35,8 +35,10 @@ chunk and appends only the bytes produced), and decompressed output is appended
 from the `Reader`'s chunk. Callers never loop over `avail_out`; the package does.
 
 `bound(n)` is an upper bound on the compressed size of `n` bytes at any level and
-wrapper, for a caller that needs to reserve room up front. Decompression has no
-bound, which is what `inflate` and `TooSmall` exist for.
+wrapper, for a caller that needs to reserve room up front. It returns `0` when
+there is no bound to give: a negative length, or one so large that the bound
+would not fit igzip's 32-bit lengths. Decompression has no bound, which is what
+`inflate` and `TooSmall` exist for.
 
 ## Streaming compression
 

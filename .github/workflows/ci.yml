@@ -8,9 +8,9 @@
 # ISA-L itself is fine on all four: its CMake picks nasm's format per platform
 # (elf64 / macho64 / win64) and has aarch64 kernels for Apple Silicon.
 #
-# The two macOS legs need macOS runners, which GitHub allocates per account: if
-# a job is cancelled within a second of starting with no runner assigned, that
-# is the account's macOS access (billing or a spending limit), not this file.
+# The two macOS legs need macOS runners, which GitHub-hosted runners supply from
+# a separate pool: those jobs can wait in the queue, or be cancelled before a
+# runner is assigned, and that is runner availability rather than this workflow.
 # The Linux and Windows legs run anywhere.
 #
 # What each job proves: the package typechecks, the C compiles against the
@@ -79,7 +79,7 @@ jobs:
           tag=$(sed -n 's/.*goose-\(v[0-9.]*\)-.*/\1/p' <<< "$ASSET")
           url="https://github.com/aardappel/goose/releases/download/$tag/$ASSET"
           mkdir -p "$RUNNER_TEMP/goose"
-          curl -fsSL "$url" -o "$RUNNER_TEMP/$ASSET"
+          curl -fsSL --proto '=https' --tlsv1.2 "$url" -o "$RUNNER_TEMP/$ASSET"
           if [[ "$ASSET" == *.zip ]]; then
             unzip -q -o "$RUNNER_TEMP/$ASSET" -d "$RUNNER_TEMP/goose"
           else

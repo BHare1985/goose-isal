@@ -51,6 +51,9 @@ fn test_layout() {
     assert(igzip::trainer_size() == TRAINER_BYTES);
     assert(igzip::bound(0) > 0);
     assert(igzip::bound(1 << 20) > (1 << 20));
+    // No representable bound: igzip lengths are 32-bit, and a ceiling-sized
+    // "bound" would be no larger than the input it is supposed to cover.
+    assert(igzip::bound(igzip::MAX_INPUT) == 0);
 
     var t = igzip::trainer();
     assert(t.symbols() == 0);

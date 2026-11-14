@@ -1,9 +1,8 @@
 # Verification
 
-What `make verify` proves, and which file proves it. The claim behind all of it
-is the one in [AGENTS.md](../AGENTS.md): *a compressor can return `Ok` with a
-plausible size and still emit a broken stream, so passing tests are not evidence
-on their own.*
+What `make verify` proves, and which file proves it. The rule behind all of it:
+*a compressor can return `Ok` with a plausible size and still emit a broken
+stream, so passing tests are not evidence on their own.*
 
 | Command | What it runs |
 |---|---|

@@ -47,6 +47,13 @@ typedef struct {
 	int64_t len;
 } igzip_slice_u8;
 
+/* A slice whose length is not zero has a data pointer: the language cannot
+ * build one otherwise, and a deserialized value has to pass the same safety
+ * check. This is a C boundary all the same, so a hand-built or hostile struct
+ * is refused rather than dereferenced. Length limits are checked separately at
+ * each entry point, because "too long" and "no data" are different failures. */
+static bool slice_data_ok(igzip_slice_u8 s) { return s.len == 0 || s.data != NULL; }
+
 /* ---- Goose-side layout mirrors ------------------------------------------- */
 /* A package's C is compiled on its own, so it cannot see the program's
  * generated types. These match igzip.goose, and the asserts below fail the
@@ -270,10 +277,14 @@ int32_t igzip_gs_version_major(void) { return ISAL_MAJOR_VERSION; }
 int32_t igzip_gs_version_minor(void) { return ISAL_MINOR_VERSION; }
 int32_t igzip_gs_version_patch(void) { return ISAL_PATCH_VERSION; }
 
+/* 0 means "no bound exists": a negative length, or one so large that the bound
+ * does not fit in the 32 bits igzip's lengths do. Clamping to the ceiling
+ * instead would hand back a bound no larger than the input, which a stored
+ * block of incompressible input can overrun. */
 int64_t igzip_gs_bound(int64_t n) {
 	if (n < 0) return 0;
 	int64_t bound = n + (n / 65535 + 1) * 6 + ISAL_BOUND_MARGIN;
-	if (bound > 0x7FFFFFF0) bound = 0x7FFFFFF0; /* igzip lengths are 32-bit */
+	if (bound > 0x7FFFFFF0) return 0;
 	return bound;
 }
 
@@ -285,6 +296,7 @@ int64_t igzip_gs_trainer_size(void) { return (int64_t)sizeof(igzip_train_state);
 int32_t igzip_gs_hist_add(Trainer_g *t, igzip_slice_u8 sample) {
 	if (!t) return ISAL_INVALID_STATE;
 	if (sample.len < 0 || sample.len > 0x7FFFFFF0) return STATELESS_OVERFLOW;
+	if (!slice_data_ok(sample)) return ISAL_INVALID_STATE;
 	int32_t len = (int32_t)sample.len;
 	if (len == 0) return COMP_OK;
 	igzip_train_state *c = train_of(t);
@@ -309,7 +321,11 @@ int64_t igzip_gs_hist_symbols(const Trainer_g *t) {
 int32_t igzip_gs_tables_build(const Trainer_g *t, HuffTables_g *dst) {
 	if (!t || !dst) return ISAL_INVALID_STATE;
 	const igzip_train_state *c = (const igzip_train_state *)(const void *)t->state;
-	return isal_create_hufftables((struct isal_hufftables *)dst->raw_g, &c->hist);
+	/* isal_create_hufftables takes a non-const histogram, but reads it only
+	 * (init_heap64_complete copies the counts into its own heap), so the cast
+	 * cannot write through to the Trainer. */
+	return isal_create_hufftables((struct isal_hufftables *)dst->raw_g,
+				      (struct isal_huff_histogram *)&c->hist);
 }
 
 /* The counters are the first 2,528 bytes of the histogram struct: 286
@@ -362,9 +378,11 @@ static int32_t run(Compressor_g *s, igzip_slice_u8 src, gs_rref out, int32_t lev
 		   const HuffTables_g *tables) {
 	if (!s) return ISAL_INVALID_STATE;
 	if (src.len < 0 || src.len > 0x7FFFFFF0) return STATELESS_OVERFLOW;
+	if (!slice_data_ok(src)) return ISAL_INVALID_STATE;
 
 	igzip_comp_state *c = comp_of(s);
 	int64_t cap = igzip_gs_bound(src.len);
+	if (cap <= 0) return STATELESS_OVERFLOW;
 
 	isal_deflate_stateless_init(&c->zs);
 	c->zs.next_in = (uint8_t *)(uintptr_t)src.data;
@@ -574,6 +592,7 @@ int32_t igzip_gs_writer_gzip_header(GooseWriter *w, bool text, uint32_t mtime, u
 				    uint32_t *out_needed) {
 	if (!w || !out_written || !out_needed) return ISAL_INVALID_STATE;
 	if (dst.len < 0 || (uint64_t)dst.len > UINT32_MAX) return STATELESS_OVERFLOW;
+	if (!slice_data_ok(dst)) return ISAL_INVALID_STATE;
 
 	int32_t rc = writer_pin(w);
 	if (rc != COMP_OK) return rc;
@@ -581,6 +600,7 @@ int32_t igzip_gs_writer_gzip_header(GooseWriter *w, bool text, uint32_t mtime, u
 	if (writer_cstr_ok(name) != COMP_OK || writer_cstr_ok(comment) != COMP_OK)
 		return IGZIP_GS_BAD_HEADER;
 	if (extra.len < 0 || (uint64_t)extra.len > UINT16_MAX) return IGZIP_GS_BAD_HEADER;
+	if (!slice_data_ok(extra)) return IGZIP_GS_BAD_HEADER;
 
 	struct isal_gzip_header h;
 	isal_gzip_header_init(&h);
@@ -632,6 +652,7 @@ int32_t igzip_gs_writer_zlib_header(GooseWriter *w, uint8_t window_bits, uint8_t
 				    uint32_t *out_written) {
 	if (!w || !out_written) return ISAL_INVALID_STATE;
 	if (dst.len < 6 || (uint64_t)dst.len > UINT32_MAX) return IGZIP_GS_BAD_HEADER;
+	if (!slice_data_ok(dst)) return ISAL_INVALID_STATE;
 
 	int32_t rc = writer_pin(w);
 	if (rc != COMP_OK) return rc;
@@ -680,6 +701,7 @@ int32_t igzip_gs_writer_set_dict(GooseWriter *w, igzip_slice_u8 dict) {
 	if (w->state != GS_FRESH) return ISAL_INVALID_STATE;
 	if (w->wrap == GS_WRAP_GZIP) return ISAL_INVALID_STATE;
 	if (dict.len < 0 || dict.len > 0x7FFFFFF0) return STATELESS_OVERFLOW;
+	if (!slice_data_ok(dict)) return ISAL_INVALID_STATE;
 	if (dict.len == 0) return COMP_OK;
 
 	struct isal_zstream *s = writer_stream(w);
@@ -751,6 +773,7 @@ int32_t igzip_gs_writer_step(GooseWriter *w, igzip_slice_u8 src, uint8_t mode,
 	if (mode > 3) return INVALID_FLUSH;
 	if (src.len < 0 || src.len > 0x7FFFFFF0) return STATELESS_OVERFLOW;
 	if (dst.len < 0 || (uint64_t)dst.len > UINT32_MAX) return STATELESS_OVERFLOW;
+	if (!slice_data_ok(src) || !slice_data_ok(dst)) return ISAL_INVALID_STATE;
 
 	int32_t rc = writer_pin(w);
 	if (rc != COMP_OK) return rc;
@@ -1009,6 +1032,7 @@ int32_t igzip_gs_reader_set_dict(GooseReader *r, igzip_slice_u8 dict) {
 	if (r->state == GS_R_FINISHED) return ISAL_INVALID_STATE;
 	if (r->wrap == GS_WRAP_GZIP) return ISAL_INVALID_STATE;
 	if (dict.len < 0 || dict.len > 0x7FFFFFF0) return STATELESS_OVERFLOW;
+	if (!slice_data_ok(dict)) return ISAL_INVALID_STATE;
 
 	struct inflate_state *s = reader_state(r);
 	/* The moment is checked before the empty case, so set_dict("") mid-body is
@@ -1038,6 +1062,7 @@ int32_t igzip_gs_reader_step(GooseReader *r, igzip_slice_u8 src, igzip_slice_u8 
 	if (!r || !out_consumed || !out_written || !out_finished) return ISAL_INVALID_STATE;
 	if (src.len < 0 || src.len > 0x7FFFFFF0) return STATELESS_OVERFLOW;
 	if (dst.len < 0 || (uint64_t)dst.len > UINT32_MAX) return STATELESS_OVERFLOW;
+	if (!slice_data_ok(src) || !slice_data_ok(dst)) return ISAL_INVALID_STATE;
 
 	int32_t rc = reader_pin(r);
 	if (rc != COMP_OK) return rc;
@@ -1105,6 +1130,7 @@ int32_t igzip_gs_reader_stateless(GooseReader *r, igzip_slice_u8 src, igzip_slic
 	if (!r || !out_consumed || !out_written) return ISAL_INVALID_STATE;
 	if (src.len < 0 || src.len > 0x7FFFFFF0) return STATELESS_OVERFLOW;
 	if (dst.len < 0 || (uint64_t)dst.len > UINT32_MAX) return STATELESS_OVERFLOW;
+	if (!slice_data_ok(src) || !slice_data_ok(dst)) return ISAL_INVALID_STATE;
 
 	int32_t rc = reader_pin(r);
 	if (rc != COMP_OK) return rc;
