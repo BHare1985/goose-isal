@@ -56,11 +56,15 @@ jobs:
           submodules: recursive
 
       # ISA-L's x86-64 kernels are nasm, and without nasm its build falls back
-      # to portable C -- which would make the matrix prove nothing. The Apple
-      # runners already carry it.
+      # to portable C -- which would make the matrix prove nothing. Every runner
+      # needs it installed, macOS included: the first macOS run failed here.
       - name: nasm
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y nasm
+
+      - name: nasm (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nasm || brew upgrade nasm
 
       - name: nasm (Windows)
         if: runner.os == 'Windows'
