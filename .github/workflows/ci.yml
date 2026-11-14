@@ -13,6 +13,12 @@
 # runner is assigned, and that is runner availability rather than this workflow.
 # The Linux and Windows legs run anywhere.
 #
+# A change that touches only prose cannot break the build, so those pushes and
+# pull requests do not start a run: the list above is markdown, docs assets and
+# licence/gitignore. The workflow file itself is not on the list, so a change to
+# this file is always exercised. Nothing on `main` requires a status check, so a
+# documentation-only pull request is not left waiting for one that will not run.
+#
 # What each job proves: the package typechecks, the C compiles against the
 # vendored ISA-L (which is the part that differs per platform -- assembly
 # format, thread-local spelling, MSVC), the round trip decodes, and the two
@@ -24,7 +30,13 @@ name: ci
 on:
   push:
     branches: [main]
+    paths-ignore: &docs
+      - "**.md"
+      - "docs/**"
+      - LICENSE
+      - .gitignore
   pull_request:
+    paths-ignore: *docs
   workflow_dispatch: # so a branch can be exercised without opening a PR
 
 permissions:
