@@ -111,6 +111,22 @@ Also out by decision, all additive and all listed with their cost in
 [coverage.md](docs/coverage.md): subset Huffman tables, the preprocessed
 dictionary cache, and `IGZIP_HUFFTABLE_STATIC`.
 
+## Tech debt and TODOs
+
+Known gaps, in the order they are worth picking up. Nothing here blocks 0.4.0.
+
+| Item | What it is | Why it matters |
+|---|---|---|
+| Windows threaded-run difference | `test/threads.goose`'s reader worker decodes bytes that differ from the body (code 3) on windows-x64 while the same program builds, and every JIT suite passes. The CI step is `continue-on-error`, so the build is asserted and the run is reported | the only known place where behaviour differs by platform. Next step: on a Windows machine, dump `out.len` vs `body.len` and the first differing index. Prime suspect is the 64 KiB `RoundBox` crossing the queue, not the codec |
+| macOS legs unverified | `macos-x64` and `macos-arm64` are in the matrix but GitHub has not allocated a runner for either (`runner_name: ""`, cancelled in a second); macOS access is per account | the only platforms where the build has never run at all. Also: `macos-13` is the last x64 image and is retiring |
+| `make test-large` skipped on Windows | the 4.2 GiB round trip runs everywhere else | it takes longer than a job is worth there; revisit if Windows throughput matters |
+| Extern-signature parity is unchecked | `_Static_assert`s pin every layout, but nothing pins a `extern fn` declaration against the C definition: a mismatched arity or type links and passes garbage. `goose_gfx/test/api_check.py` does this by parsing both sides | the one boundary check `goose_gfx` has that this package does not. A Goose test reading `igzip.goose` and `src/igzip_shim.c` would keep `make test` python-free |
+| Streamed failures do not travel with the value | `igzip::status()` is per thread and describes the *call*, so a helper taking `r: Reader&` cannot report *r's* reason | a latched `status` field on `Writer`/`Reader` fixes it at +8 bytes each and a bump of the pinned asserts. Deliberate omission, not an oversight |
+| Error-return shape is still contested | the `const Status?` variant, complete and green, is on branch `wip/status-optional` | decide or delete; two live designs is a maintenance trap |
+| No fuzz target | `make stress` mutates a fixed corpus under ASan rather than fuzzing | the reader is the package's untrusted-input surface; libFuzzer over `inflate`/`read` would find what a fixed mutation set cannot |
+| ISA-L bump is manual | checkout the tag, update `EXPECTED_ISA_L`, run verify and stress (docs/internals.md) | the procedure is written down but nothing enforces that it was followed |
+| Doc snippets are compiled by hand | every snippet in README and guide was compiled against the package before a release, but nothing does it automatically | a doc example that stops compiling is invisible until someone tries it |
+
 ## 1.0.0 — stable
 
 - Freeze the surface; additive changes only.

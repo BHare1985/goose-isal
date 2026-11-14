@@ -146,6 +146,22 @@ jobs:
           goose build test/large_stream.goose -o "$RUNNER_TEMP/large_stream"
           "$RUNNER_TEMP/large_stream"
 
+      # Two things the local targets run that CI should not skip: the ASan
+      # harnesses (bounds and hostile input on the shim itself) and the
+      # independent decoder. Both are cheap and ubuntu has what they need, so
+      # they live on the Linux leg rather than being a local-only ritual.
+      - name: make stress (AddressSanitizer)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: make stress
+
+      - name: independent decode (CPython zlib)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          GOOSE_HOME="$HOME/.goose" make crosscheck
+
       - name: examples typecheck
         shell: bash
         run: |
