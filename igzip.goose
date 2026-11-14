@@ -58,6 +58,11 @@ enum Wrapper {
 // `Writer` splits larger inputs into windows.
 let MAX_INPUT = 0x7FFFFFF0;
 
+// The largest custom gzip header accepted, bounding the temporary used when a
+// header does not fit in the 64 KiB chunk. RFC 1952 bounds `extra` at 65,535
+// bytes but places no bound on `name` or `comment`; this API does.
+let MAX_HEADER = 1 << 20;
+
 // How a call ended. `Ok` is the only success.
 enum Status {
     Ok,
@@ -225,6 +230,7 @@ fn status_of(rc: i32) -> Status {
         -7 => Status.BadWrapper,
         -8 => Status.BadHeader,
         -9 => Status.BadState,
+        -10 => Status.BadTable,
         _ => Status.Other,
     };
 }
@@ -416,6 +422,13 @@ fn reset(w: Writer&) -> Status {
 // larger than that, in which case it is built in a temporary of the required
 // size and appended.
 fn write_gzip_header(w: Writer&, hdr: GzipHeader, out: u8[>..]&) -> Status {
+    // Bound the NUL-terminated copies before making them; the shim also caps
+    // the measured header, but this refuses an untrusted multi-gigabyte name
+    // before the first copy.
+    guard hdr.name.len <= MAX_HEADER && hdr.comment.len <= MAX_HEADER else {
+        return Status.BadHeader;
+    }
+
     var name_buf: u8[>..] = [];
     if hdr.name.len > 0 {
         name_buf.append(hdr.name);
@@ -434,6 +447,7 @@ fn write_gzip_header(w: Writer&, hdr: GzipHeader, out: u8[>..]&) -> Status {
     if rc != 0 { return status_of(rc); }
 
     if needed > 0 {
+        guard needed <= MAX_HEADER else { return Status.BadHeader };
         // Larger than the 64 KiB chunk. Build the header in a temporary of
         // exactly the required size; `out` may be one of the arrays `hdr`'s
         // slices point into, and growing it while those views are live is not

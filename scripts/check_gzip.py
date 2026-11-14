@@ -34,7 +34,7 @@ NAMED = {
     "trained.gz": 1,
     "empty.gz": 0,
 }
-EXPECTED_STREAMS = 42
+EXPECTED_STREAMS = 43
 
 
 def inflate(data: bytes, kind: str) -> bytes:
@@ -195,6 +195,7 @@ def main() -> int:
     c.check("stream/custom_header.gz", "gzip", sbody, mtime_zero=False)
     c.check("stream/large_header.gz", "gzip", sbody, mtime_zero=False)
     c.check("stream/zlib_header.zlib", "zlib", sbody)
+    c.check("stream/zlib_window8.zlib", "zlib", sbody)
     c.check_with_zdict("stream/dict_zlib.zlib", "zlib", sbody, zdict)
     c.check_with_zdict("stream/dict_zlib_explicit.zlib", "zlib", sbody, zdict)
     c.check_with_zdict("stream/dict_raw.deflate", "deflate", sbody, zdict)
@@ -272,7 +273,29 @@ def main() -> int:
     if window != 12 or flevel != 2 or ((cmf << 8) + flg) % 31 != 0:
         c.fail("stream/zlib_header.zlib", f"window {window}, flevel {flevel}, bad check bits")
     else:
-        print("[ok]   zlib header              window 12, FLEVEL 2")
+        # A strict decoder uses the CMF window, not 15: the deflate stream must
+        # not reference distances outside the window it advertised.
+        try:
+            d = zlib.decompressobj(window)
+            got = d.decompress(raw) + d.flush()
+            if got != sbody:
+                c.fail("stream/zlib_header.zlib", "strict-window decode produced different bytes")
+            else:
+                print(f"[ok]   zlib header              window {window}, FLEVEL {flevel}, strict decode")
+        except Exception as exc:  # noqa: BLE001
+            c.fail("stream/zlib_header.zlib", f"strict-window decode: {exc}")
+
+    raw8 = (stream / "zlib_window8.zlib").read_bytes()
+    window8 = (raw8[0] >> 4) + 8
+    try:
+        d = zlib.decompressobj(window8)
+        got = d.decompress(raw8) + d.flush()
+        if got != sbody:
+            c.fail("stream/zlib_window8.zlib", "strict-window decode produced different bytes")
+        else:
+            print(f"[ok]   zlib window {window8}           strict decode")
+    except Exception as exc:  # noqa: BLE001
+        c.fail("stream/zlib_window8.zlib", f"strict-window decode: {exc}")
 
     for rel in ["stream/dict_zlib.zlib", "stream/dict_zlib_explicit.zlib"]:
         raw = (root / rel).read_bytes()

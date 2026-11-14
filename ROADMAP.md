@@ -64,7 +64,7 @@ separate `Writer` (367,280 B), not a mode on `Compressor`:
 - A mid-stream copy is rejected by a `pinned_self` check; `reset` recovers it.
 - Tests are split by concern: `test/writer_contract.goose` for state and edge
   cases, `test/streaming.goose` for end-to-end behavior, and
-  `test/support/` for shared generators; 42 streams are independently decoded.
+  `test/support/` for shared generators; 43 streams are independently decoded.
 
 ## 0.3.0 — inflate
 

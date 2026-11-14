@@ -367,6 +367,9 @@ fn test_headers(body: const u8[:]) {
     assert((z2[0] >> 4) == 0);
     assert((z2[1] >> 6) == 3);
     assert(((z2[0] as u32) << 8 | z2[1]) % 31 == 0);
+    assert(wz2.write(body, z2) == igzip::Status.Ok);
+    assert(wz2.finish(z2) == igzip::Status.Ok);
+    assert(write_file(str(TMP, "/zlib_window8.zlib"), z2));
 
     var wz3 = igzip::zlib_writer(1);
     var z3: u8[>..] = [];
@@ -388,6 +391,15 @@ fn test_headers(body: const u8[:]) {
     assert(w11.write_zlib_header(igzip::ZlibHeader { window_bits: 7 }, o11) == igzip::Status.BadHeader);
     assert(w11.write_zlib_header(igzip::ZlibHeader { flevel: 4 }, o11) == igzip::Status.BadHeader);
     assert(w11.write_zlib_header(igzip::ZlibHeader { dict_flag: true }, o11) == igzip::Status.BadHeader);
+
+    // The same header API must not turn an unbounded name into an unbounded
+    // temporary: MAX_HEADER is the cap, and nothing is appended when it trips.
+    var huge: u8[>..] = [];
+    for i in igzip::MAX_HEADER + 1 { huge.push(110); }
+    var w12 = igzip::gzip_writer(1);
+    var o12: u8[>..] = [];
+    assert(w12.write_gzip_header(igzip::GzipHeader { name: huge }, o12) == igzip::Status.BadHeader);
+    assert(o12.len == 0);
 }
 
 fn test_dict(body: const u8[:]) {
@@ -531,6 +543,31 @@ fn test_errors(body: const u8[:]) {
     bad.raw[41] = 0xFFFFFFFF;
     var w3 = igzip::gzip_writer(1);
     assert(w3.set_tables(bad) == igzip::Status.BadTable);
+
+    // A Writer that was deserialized or had its public table field forged
+    // bypasses set_tables, so the use site validates it too.
+    var forged = igzip::Writer { tables: bad.raw, has_tables: true, .. };
+    var fo: u8[>..] = [];
+    assert(forged.write(body, fo) == igzip::Status.BadTable);
+    assert(forged.clear_tables() == igzip::Status.Ok);
+
+    // A Fresh Writer carrying state that only an initialized stream can back
+    // is refused. reset is the recovery path.
+    var fd = igzip::Writer { has_dict: true, .. };
+    var fdo: u8[>..] = [];
+    assert(fd.write(body, fdo) == igzip::Status.BadState);
+    assert(fd.reset() == igzip::Status.Ok);
+    assert(fd.write(body, fdo) == igzip::Status.Ok);
+    assert(fd.finish(fdo) == igzip::Status.Ok);
+
+    var fh = igzip::Writer { hdr_written: true, .. };
+    var fho: u8[>..] = [];
+    assert(fh.write(body, fho) == igzip::Status.BadState);
+
+    var fs = igzip::Writer { state: igzip::WriterState.Open, .. };
+    var fso: u8[>..] = [];
+    assert(fs.write(body, fso) == igzip::Status.BadState);
+    assert(fs.reset() == igzip::Status.Ok);
 
     assert(igzip::status_name(igzip::Status.BadHeader).len > 0);
     assert(!igzip::Status.BadHeader.ok());

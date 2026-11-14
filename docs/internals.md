@@ -91,6 +91,43 @@ Each of these was measured, not assumed.
    copies in Goose and the shim checks the contract; passing a raw slice would
    silently omit the terminator.
 
+### Streaming surface: what is exposed
+
+| ISA-L facility | Goose surface |
+|---|---|
+| `isal_deflate_init` / `isal_deflate` / `isal_deflate_reset` | `Writer`; `write`, `flush`, `finish`, `reset` |
+| `NO_FLUSH`, `SYNC_FLUSH`, `FULL_FLUSH`, `end_of_stream` | `write`, `flush(Sync|Full)`, `finish` |
+| `isal_deflate_set_dict` | `set_dict` (Fresh only; the dictionary is copied) |
+| `isal_deflate_set_hufftables` (custom/default) | `set_tables` / `clear_tables` |
+| `isal_write_gzip_header` / `isal_gzip_header_init` | `GzipHeader` / `write_gzip_header` |
+| `isal_write_zlib_header` / `isal_zlib_header_init` | `ZlibHeader` / `write_zlib_header` |
+| `IGZIP_GZIP`, `IGZIP_GZIP_NO_HDR`, `IGZIP_ZLIB`, `IGZIP_ZLIB_NO_HDR`, `IGZIP_DEFLATE` | `Wrapper` plus the explicit-header paths |
+| `isal_zstream.hist_bits` | `ZlibHeader.window_bits`; raw/gzip use the format default |
+| output staging and `avail_out` | the `Writer`'s 64 KiB `chunk`, drained by `write`/`flush`/`finish` |
+
+Deliberately not exposed in 0.2, with the reason:
+
+- **`IGZIP_HUFFTABLE_STATIC`** — a table choice, not a streaming operation.
+  Trained and default tables are the package's supported policy; this is an
+  additive `set_static_tables` if a caller needs it.
+- **`isal_deflate_process_dict` / `isal_deflate_reset_dict`** — a
+  preprocessed-dictionary cache. `set_dict` covers correctness; the cache is a
+  performance feature for a fixed dictionary and can be added additively.
+- **`isal_deflate_set_dict` after a flush** — legal in ISA-L for raw streams,
+  but zlib's FDICT header cannot be retrofitted, so the Goose API keeps the
+  dictionary to `Fresh`.
+- **`level_buf_size` / a caller-chosen level buffer** — the value carries
+  `ISAL_DEF_LVL3_MEDIUM` (217,088 bytes), which satisfies levels 1-3 and is
+  pinned by the layout. A smaller buffer would change the `Writer` size and
+  compression decisions; it is not a 0.2 knob.
+- **`isal_inflate_*`, `isal_read_*`, checksums** — 0.3 and 0.4.
+
+The zlib `window_bits` field is not cosmetic: the shim also sets
+`stream.hist_bits` to the same value before deflating. A 4 KiB window on the
+header with a 32 KiB match history makes strict decoders reject the stream with
+`invalid distance too far back`; `zlib.decompressobj(window_bits)` in the
+checker is the regression test.
+
 Nothing from libdeflate belongs here, ever.
 
 ## Memory safety notes
@@ -109,9 +146,22 @@ Nothing from libdeflate belongs here, ever.
   deserialized from a cache file or the network, with a count past that array
   makes igzip read past the value and copy what it finds into the compressed
   output. `compress` validates `deflate_hdr_count` and `deflate_hdr_extra_bits`
-  before any table reaches igzip and returns `Status.BadTable` instead. Anything
-  that adds a path to a table — loading one from disk, accepting one over the
-  wire — must go through that check.
+  before any table reaches igzip and returns `Status.BadTable` instead. The
+  `Writer` validates in `igzip_gs_writer_step`, not only in `set_tables`: a
+  deserialized `Writer` with `has_tables = true`, or a caller that mutates the
+  public `tables` field, is checked at the use site. `clear_tables` remains
+  available to drop a table that fails the check.
+- **A deserialized `Writer` is not trusted either.** A `Fresh` Writer whose
+  `pinned_self` is zero but which carries `has_dict` or `hdr_written` has no C
+  dictionary/header behind those flags; `writer_pin` returns `BadState` and
+  `reset` clears it. A Writer in `Open`, `Flushed` or `Finished` with no pinned
+  address is similarly refused. Only the `tables` bytes are self-contained, and
+  they are validated at use.
+- **Header temporaries are bounded.** RFC 1952 bounds `extra` at 65,535 bytes
+  but not `name`/`comment`. A header that does not fit the 64 KiB chunk is built
+  in a temporary of the measured size; `MAX_HEADER` (1 MiB) caps that
+  allocation, so an untrusted long name is `BadHeader` rather than an unbounded
+  allocation.
 - **igzip does not write through its input pointer.** `isal_deflate_stateless`
   and `isal_update_histogram` take `uint8_t *`, and the shim passes a
   `const u8[:]` by casting away const. This was checked in the vendored sources:

@@ -103,9 +103,11 @@ typedef struct {
 
 #define GS_CHUNK 65536
 
-/* Not an ISA-L code: a header field the API cannot encode (an interior NUL,
- * too-long name/comment/extra, or an impossible zlib flag). */
+/* Not ISA-L codes: a header field the API cannot encode (an interior NUL,
+ * too-long name/comment/extra, or an impossible zlib flag), and a Writer whose
+ * public table field was mutated or deserialized without validation. */
 #define IGZIP_GS_BAD_HEADER (-8)
+#define IGZIP_GS_BAD_TABLE (-10)
 
 typedef struct {
 	uint64_t stream[sizeof(struct isal_zstream) / 8];
@@ -372,15 +374,21 @@ static int32_t writer_pin_at(GooseWriter *w, int32_t level) {
 	if (!w) return ISAL_INVALID_STATE;
 	if (w->wrap > GS_WRAP_ZLIB) return INVALID_FLUSH;
 	if (w->state > GS_FINISHED) return ISAL_INVALID_STATE;
+	/* A header flag without a HeaderWritten state has no header behind it. */
+	if (w->state == GS_FRESH && w->hdr_written) return ISAL_INVALID_STATE;
 
 	if (w->state == GS_FRESH) {
 		if (w->pinned_self == (uint64_t)(uintptr_t)w) return COMP_OK;
 		/* A Fresh Writer that has already been used for set_dict or
 		 * set_tables must not be re-initialized: the dictionary lives in the
-		 * stream buffer, not in a field the shim could replay. */
+		 * stream buffer, not in a field the shim could replay. A deserialized
+		 * Writer carrying either flag has no such buffer to replay, so it is
+		 * refused rather than emitting a header that lies about its state. */
 		if (w->pinned_self != 0) return ISAL_INVALID_STATE;
+		if (w->has_dict || w->hdr_written) return ISAL_INVALID_STATE;
 		struct isal_zstream *s = writer_stream(w);
 		isal_deflate_init(s);
+		s->hist_bits = 0;
 		writer_set_level(w, s, level);
 		s->gzip_flag = writer_flag(w->wrap);
 		if (w->has_tables) s->hufftables = writer_tables(w);
@@ -420,6 +428,7 @@ static int32_t writer_auto_zlib(GooseWriter *w, struct isal_zstream *s, igzip_sl
 	s->avail_out = 0;
 	if (need != 0) return IGZIP_GS_BAD_HEADER;
 	s->gzip_flag = IGZIP_ZLIB_NO_HDR;
+	s->hist_bits = 15;
 
 	uint32_t n = s->total_out - before;
 	*written = n;
@@ -453,6 +462,7 @@ int32_t igzip_gs_writer_reset(GooseWriter *w) {
 	isal_deflate_reset(s);
 	s->end_of_stream = 0;
 	s->flush = NO_FLUSH;
+	s->hist_bits = 0;
 	s->gzip_flag = writer_flag(w->wrap);
 	s->level = w->has_tables ? 0 : (uint32_t)w->base_level;
 	if (s->level > 0) {
@@ -580,6 +590,7 @@ int32_t igzip_gs_writer_zlib_header(GooseWriter *w, uint8_t window_bits, uint8_t
 
 	uint32_t written = s->total_out - before;
 	s->gzip_flag = IGZIP_ZLIB_NO_HDR;
+	s->hist_bits = window_bits;
 	w->total_out += written;
 	w->state = GS_HDR;
 	w->hdr_written = true;
@@ -668,6 +679,10 @@ int32_t igzip_gs_writer_step(GooseWriter *w, igzip_slice_u8 src, uint8_t mode,
 	int32_t rc = writer_pin(w);
 	if (rc != COMP_OK) return rc;
 	if (w->state == GS_FINISHED) return ISAL_INVALID_STATE;
+	if (w->has_tables) {
+		const HuffTables_g *ht = (const HuffTables_g *)(const void *)w->tables;
+		if (igzip_gs_tables_check(ht) != COMP_OK) return IGZIP_GS_BAD_TABLE;
+	}
 
 	struct isal_zstream *s = writer_stream(w);
 	uint32_t header_written = 0;

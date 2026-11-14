@@ -157,7 +157,9 @@ guard w.finish(out).ok() else { abort("finish failed"); };
 RFC 1952 wants `name` and `comment` NUL-terminated; the wrapper adds the
 terminator. An interior NUL or an `extra` field longer than 65,535 bytes is
 `Status.BadHeader`. A header larger than the 64 KiB chunk is still supported: it
-is built in a temporary of the measured required size and appended.
+is built in a temporary of the measured required size and appended. Headers
+above `MAX_HEADER` (1 MiB) are rejected, so an untrusted name or comment cannot
+force an unbounded temporary.
 
 `ZlibHeader` exposes `window_bits` (8–15) and `flevel` (0–3). The zlib CMF/FLG
 fields carry both.
@@ -224,6 +226,7 @@ common case is `guard err.ok() else { ... }`, and a specific failure is
 | `compressor_size()`, `writer_size()`, `trainer_size()` | the pinned value sizes |
 | `MAX_INPUT` | one-shot input limit, 0x7FFFFFF0 bytes |
 | `MAX_IN_STEP` | `write`'s input window, the same 32-bit limit |
+| `MAX_HEADER` | custom gzip header cap, 1 MiB |
 
 ## Why trained tables
 
@@ -272,14 +275,15 @@ chunk. Level 0 is decoded rather than compared, for the ISA-L reason below.
 pieces, checking the 64-bit total and the wrapped 32-bit gzip ISIZE without
 holding the stream.
 
-**Independent decode** (`scripts/check_gzip.py`): **42 streams** are inflated
+**Independent decode** (`scripts/check_gzip.py`): **43 streams** are inflated
 with CPython's zlib and compared byte for byte — every wrapper and level, sizes
 on deflate's block seams, deterministic repeats, concatenated members,
 incompressible noise, trained and trained-on-half streams, the empty member,
 chunked/default/level-0 streams, both flush points, the trained-table flush swap,
 custom and large headers, the zlib header, dictionary streams with `zdict`, and
 the 4 MiB stream. It also checks `mtime = 0` where promised, parses header
-fields, and checks FDICT/DICTID.
+fields, checks FDICT/DICTID, and decodes the custom zlib windows with
+`zlib.decompressobj(window_bits)` rather than the permissive 15-bit default.
 
 **Memory safety** (`make stress`): `scripts/bound_stress.c` allocates `bound(n)`
 *exactly* and compresses adversarial inputs at every level and wrapper under
@@ -304,7 +308,7 @@ emits a valid stream of its own.
 [ok]   matrix/gzip_3.gz          1887 bytes    6.0% of 31364
 [ok]   trained.gz                2135 bytes    6.8% of 31364
 [ok]   trained table saves 960 bytes over the level 0 default
-42/42 streams valid
+43/43 streams valid
 4 workers, 16 jobs, 2977 bytes for 425 records
 4200 MiB, ISIZE 109051904, total_in 4404019200
 ```
