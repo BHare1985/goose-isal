@@ -158,6 +158,40 @@ fn test_flush() {
     assert(wt.flush(to) == igzip::Status.Ok);
     assert(wt.finish(to) == igzip::Status.Ok);
     assert(write_file(str(TMP, "/sync_twice.gz"), to));
+
+    // What the flush claims, asserted in Goose rather than in a Python script:
+    // the bytes after a Full flush are a complete raw stream of B on their own,
+    // which is only possible because the flush dropped the history they would
+    // otherwise have referenced.
+    var tail_reader = igzip::raw_reader();
+    let tail, tail_err = tail_reader.inflated(ro[mark..]);
+    assert(tail_err == igzip::Status.Ok);
+    assert(support::same(tail, b));
+
+    // A redundant flush marker does not confuse the decoder either.
+    var twice = igzip::gzip_reader();
+    var two: u8[>..] = [];
+    let t_used, t_err = twice.read(to, two);
+    assert(t_err == igzip::Status.Ok);
+    assert(t_used == to.len);
+    assert(twice.finish() == igzip::Status.Ok);
+    assert(support::same(two, a));
+
+    // The flush larger than the 64 KiB chunk decodes to the body twice over.
+    var big_reader = igzip::gzip_reader();
+    let big_plain, big_err = big_reader.inflated(nout);
+    assert(big_err == igzip::Status.Ok);
+    assert(big_plain.len == noise.len * 2);
+    assert(support::same(big_plain[..noise.len], noise));
+    assert(support::same(big_plain[noise.len..], noise));
+
+    // And the Full-flushed gzip member decodes as one stream, A then B.
+    var full_reader = igzip::gzip_reader();
+    let full_plain, full_err = full_reader.inflated(gz);
+    assert(full_err == igzip::Status.Ok);
+    assert(full_plain.len == a.len + b.len);
+    assert(support::same(full_plain[..a.len], a));
+    assert(support::same(full_plain[a.len..], b));
 }
 
 fn test_windows() {

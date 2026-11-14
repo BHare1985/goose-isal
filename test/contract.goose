@@ -5,9 +5,12 @@
 // Threading is a separate program, test/threads.goose, because igzip's workers
 // need `goose build`.
 //
-// Every stream written to build/tmp is later inflated by
-// scripts/check_gzip.py: a compressor can return Ok with a plausible size and
-// still emit a broken stream, so size assertions alone prove nothing.
+// Every stream written to build/tmp is decoded twice: once here, by this
+// package's own Reader (`decode_is`), and once by scripts/check_gzip.py, which
+// is an independent decoder. A compressor can return Ok with a plausible size
+// and still emit a broken stream, so size assertions alone prove nothing -- and
+// a compressor and a decompressor that agree can agree on something broken,
+// which is why the Python crosscheck stays.
 import std;
 import os;
 import igzip from "..";
@@ -320,6 +323,15 @@ fn test_empty() {
 // Every artifact scripts/check_gzip.py expects, written from one place so the
 // tests above stay pure assertions. The checker discovers these by name, so a
 // new case here needs no Python change.
+// The self-hosting half: this package reads back what it wrote. Assertion
+// messages name the artifact, so a failure says which stream is wrong.
+fn decode_is(what: const u8[:], wrap: igzip::Wrapper, stream: const u8[:], want: const u8[:]) {
+    var r = igzip::reader(wrap);
+    let out, err = r.inflated(stream);
+    guard err == igzip::Status.Ok else { abort(str("artifact ", what, " does not decode")); };
+    guard support::same(out, want) else { abort(str("artifact ", what, " decodes to the wrong bytes")); };
+}
+
 fn write_artifacts(body: const u8[:]) {
     assert(make_dir(TMP));
     assert(write_file(str(TMP, "/body.txt"), body));
@@ -335,6 +347,7 @@ fn write_artifacts(body: const u8[:]) {
             assert(err == igzip::Status.Ok);
             let path = str(dir, "/", name_of(w), "_", level, ".", ext_of(w));
             assert(write_file(path, out));
+            decode_is(path, w, out, body);
         }
     }
 
@@ -349,6 +362,7 @@ fn write_artifacts(body: const u8[:]) {
         assert(err == igzip::Status.Ok);
         assert(write_file(str(TMP, "/size_", n, ".gz"), out));
         assert(write_file(str(TMP, "/size_", n, ".bin"), src));
+        decode_is(str("size_", n), igzip::Wrapper.Gzip, out, src);
     }
 
     // Incompressible input, to prove the expansion path inflates too.
@@ -359,6 +373,7 @@ fn write_artifacts(body: const u8[:]) {
     assert(err_n == igzip::Status.Ok);
     assert(write_file(str(TMP, "/incompressible.gz"), noisy));
     assert(write_file(str(TMP, "/incompressible.bin"), noise_bytes));
+    decode_is("incompressible", igzip::Wrapper.Gzip, noisy, noise_bytes);
 
     var lv1 = igzip::gzip_compressor(1);
     let gz, err_1 = lv1.compressed(body);
@@ -372,6 +387,10 @@ fn write_artifacts(body: const u8[:]) {
     assert(lv1.compress(body, two) == igzip::Status.Ok);
     assert(lv1.compress(body, two) == igzip::Status.Ok);
     assert(write_file(str(TMP, "/twomembers.gz"), two));
+    var doubled: u8[>..] = [];
+    doubled.append(body);
+    doubled.append(body);
+    decode_is("twomembers", igzip::Wrapper.Gzip, two, doubled);
 
     var t = igzip::trainer();
     assert(t.add(body) == igzip::Status.Ok);
@@ -382,16 +401,19 @@ fn write_artifacts(body: const u8[:]) {
     let trained, err_t = trained_c.compressed(body);
     assert(err_t == igzip::Status.Ok);
     assert(write_file(str(TMP, "/trained.gz"), trained));
+    decode_is("trained", igzip::Wrapper.Gzip, trained, body);
 
     // The same table on a body it never sampled.
     let half = body.len / 2;
     let other, err_o = trained_c.compressed(body[half..]);
     assert(err_o == igzip::Status.Ok);
     assert(write_file(str(TMP, "/trained_half.gz"), other));
+    decode_is("trained_half", igzip::Wrapper.Gzip, other, body[half..]);
 
     let empty, err_e = igzip::gzip("");
     assert(err_e == igzip::Status.Ok);
     assert(write_file(str(TMP, "/empty.gz"), empty));
+    decode_is("empty", igzip::Wrapper.Gzip, empty, "");
 }
 
 fn main() {

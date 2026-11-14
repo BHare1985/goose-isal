@@ -37,6 +37,20 @@ fn one_shot(body: const u8[:], wrap: igzip::Wrapper, level: i32) -> u8[>..] {
     return out;
 }
 
+// Decodes a whole member this file just wrote. Header *inspection* is out of
+// scope; what is asserted is that a reader accepts every header a writer emits.
+fn decoded(wrap: igzip::Wrapper, stream: const u8[:]) -> u8[>..] {
+    var r = igzip::reader(wrap);
+    var out: u8[>..] = [];
+    let used, err = r.read(stream, out);
+    assert(err == igzip::Status.Ok);
+    assert(used == stream.len);
+    assert(r.finished());
+    assert(r.finish() == igzip::Status.Ok);
+    assert(r.total_out == out.len as u64);
+    return out;
+}
+
 fn test_layout() {
     assert(igzip::writer_size() == WRITER_BYTES);
     assert(igzip::MAX_IN_STEP == igzip::MAX_INPUT);
@@ -400,6 +414,16 @@ fn test_headers(body: const u8[:]) {
     var o12: u8[>..] = [];
     assert(w12.write_gzip_header(igzip::GzipHeader { name: huge }, o12) == igzip::Status.BadHeader);
     assert(o12.len == 0);
+
+    // Every stream above must decode, header and all: an all-fields header, one
+    // larger than the 64 KiB chunk, and two zlib windows a strict decoder would
+    // reject if the history did not match the header.
+    assert(support::same(decoded(igzip::Wrapper.Gzip, out), body));
+    assert(support::same(decoded(igzip::Wrapper.Gzip, big), body));
+    assert(support::same(decoded(igzip::Wrapper.Gzip, o4), body));
+    assert(support::same(decoded(igzip::Wrapper.Gzip, o5), body));
+    assert(support::same(decoded(igzip::Wrapper.Zlib, zo), body));
+    assert(support::same(decoded(igzip::Wrapper.Zlib, z2), body));
 }
 
 fn test_dict(body: const u8[:]) {

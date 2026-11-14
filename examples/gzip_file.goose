@@ -7,6 +7,10 @@
 // A one-shot tool: `igzip::gzip` declares the compressor, compresses, and lets
 // the scope free it. A server keeps one compressor per thread instead and
 // appends into a buffer it already owns.
+//
+// The file is then read back with the package's own reader before the tool
+// says it succeeded. A compressor can return Ok with a plausible size and still
+// emit a broken stream, so "it compressed" is not evidence.
 import std;
 import os;
 import igzip from "..";
@@ -36,6 +40,12 @@ fn main() {
 
     let path = str(argv[1], ".gz");
     guard write_file(path, gz) else { abort(str("cannot write ", path)); };
+
+    // Read it back: a complete member that decodes to what went in.
+    var r = igzip::gzip_reader();
+    let back, derr = r.inflated(gz);
+    guard derr.ok() else { abort(str("verify failed: ", igzip::status_name(derr))); };
+    guard back == body else { abort("verify failed: the file does not round trip"); };
 
     print(path, ": ", body.len, " -> ", gz.len, " bytes");
     if body.len > 0 {

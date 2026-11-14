@@ -322,6 +322,9 @@ static int32_t run(Compressor_g *s, igzip_slice_u8 src, gs_rref out, int32_t lev
 	c->zs.hufftables = NULL;
 
 	if (rc != COMP_OK) return rc;
+	/* The builder's top is moved by `written`, so a number larger than the room
+	 * offered would move it past data igzip never wrote. */
+	if (written > cap) return ISAL_INVALID_STATE;
 	bld_claim(out, written);
 	return COMP_OK;
 }
@@ -740,6 +743,14 @@ int32_t igzip_gs_writer_step(GooseWriter *w, igzip_slice_u8 src, uint8_t mode,
 	/* Borrowed input and output die with the call. */
 	s->next_in = NULL;
 	s->next_out = NULL;
+
+	if (consumed > (uint32_t)src.len || written > body_cap + header_written) {
+		w->state = GS_FINISHED;
+		*out_consumed = 0;
+		*out_written = 0;
+		*out_more = false;
+		return ISAL_INVALID_STATE;
+	}
 	w->total_in += consumed;
 	w->total_out += written;
 
@@ -763,4 +774,312 @@ int32_t igzip_gs_writer_step(GooseWriter *w, igzip_slice_u8 src, uint8_t mode,
 	*out_written = written;
 	*out_more = more;
 	return rc;
+}
+
+/* ---- streaming reader ---------------------------------------------------- */
+
+#define GS_R_FRESH 0
+#define GS_R_OPEN 1
+#define GS_R_FINISHED 2
+
+/* The reader family's own codes, disjoint from ISA-L's *and* from the deflate
+ * family's: inflate reuses -1 for ISAL_INVALID_BLOCK and -3 for
+ * ISAL_INVALID_LOOKBACK, which the deflate status table reads as
+ * STATELESS_OVERFLOW and ISAL_INVALID_STATE. One translator per family keeps
+ * every call site honest. */
+#define IGZIP_GS_TRUNCATED (-11)
+#define IGZIP_GS_NEED_DICT (-12)
+#define IGZIP_GS_TOO_SMALL (-13)
+#define IGZIP_GS_CORRUPT (-14)
+#define IGZIP_GS_BAD_SUM (-15)
+
+typedef struct {
+	uint64_t istate[sizeof(struct inflate_state) / 8];
+	uint8_t chunk[GS_CHUNK];
+	uint64_t pinned_self;
+	uint64_t total_in;
+	uint64_t total_out;
+	uint8_t wrap;
+	uint8_t state;
+	bool has_dict;
+} GooseReader;
+
+_Static_assert(sizeof(struct inflate_state) == 87368, "inflate_state size changed");
+_Static_assert(_Alignof(struct inflate_state) <= 8, "inflate_state needs more alignment than u64 gives");
+_Static_assert(sizeof(GooseReader) == 152936, "Reader size changed; update igzip.goose");
+_Static_assert(sizeof(((GooseReader *)0)->chunk) == GS_CHUNK, "Reader.chunk must be 64 KiB");
+
+_Static_assert(offsetof(GooseReader, istate) == 0, "Reader.istate offset");
+_Static_assert(offsetof(GooseReader, chunk) == 87368, "Reader.chunk offset");
+_Static_assert(offsetof(GooseReader, pinned_self) == 152904, "Reader.pinned_self offset");
+_Static_assert(offsetof(GooseReader, total_in) == 152912, "Reader.total_in offset");
+_Static_assert(offsetof(GooseReader, total_out) == 152920, "Reader.total_out offset");
+_Static_assert(offsetof(GooseReader, wrap) == 152928, "Reader.wrap offset");
+_Static_assert(offsetof(GooseReader, state) == 152929, "Reader.state offset");
+_Static_assert(offsetof(GooseReader, has_dict) == 152930, "Reader.has_dict offset");
+
+/* Every field of inflate_state this file reads. Measured against the pin. */
+_Static_assert(offsetof(struct inflate_state, total_out) == 12, "total_out offset");
+_Static_assert(offsetof(struct inflate_state, block_state) == 21160, "block_state offset");
+_Static_assert(offsetof(struct inflate_state, crc_flag) == 21172, "crc_flag offset");
+_Static_assert(offsetof(struct inflate_state, wrapper_flag) == 21204, "wrapper_flag offset");
+_Static_assert(offsetof(struct inflate_state, tmp_out_valid) == 21208, "tmp_out_valid offset");
+_Static_assert(offsetof(struct inflate_state, tmp_out_processed) == 21212, "tmp_out_processed offset");
+_Static_assert(offsetof(struct inflate_state, tmp_out_buffer) == 21544, "tmp_out_buffer offset");
+_Static_assert(sizeof(((struct inflate_state *)0)->tmp_out_buffer) == 65824, "history buffer size");
+
+static uint32_t reader_flag(uint8_t wrap) {
+	if (wrap == GS_WRAP_GZIP) return IGZIP_GZIP;
+	if (wrap == GS_WRAP_ZLIB) return IGZIP_ZLIB;
+	return IGZIP_DEFLATE;
+}
+
+static struct inflate_state *reader_state(GooseReader *r) {
+	return (struct inflate_state *)(void *)r->istate;
+}
+
+/* Inflate's returns, translated into this package's codes. ISAL_INVALID_WRAPPER
+ * and ISAL_UNSUPPORTED_METHOD are both "this is not the container you said it
+ * was", which is BadWrapper (INVALID_FLUSH) on the Goose side. -3 is
+ * ISAL_INVALID_LOOKBACK here, never ISAL_INVALID_STATE: isal_inflate does not
+ * return the latter, and the set_dict path that can maps it separately. */
+static int32_t reader_status(int32_t rc) {
+	switch (rc) {
+	case ISAL_DECOMP_OK: return COMP_OK;
+	case ISAL_END_INPUT: return IGZIP_GS_TRUNCATED;
+	case ISAL_OUT_OVERFLOW: return IGZIP_GS_TOO_SMALL;
+	case ISAL_NEED_DICT: return IGZIP_GS_NEED_DICT;
+	case ISAL_INVALID_BLOCK:
+	case ISAL_INVALID_SYMBOL:
+	case ISAL_INVALID_LOOKBACK: return IGZIP_GS_CORRUPT;
+	case ISAL_INVALID_WRAPPER:
+	case ISAL_UNSUPPORTED_METHOD: return INVALID_FLUSH;
+	case ISAL_INCORRECT_CHECKSUM: return IGZIP_GS_BAD_SUM;
+	default: return rc;
+	}
+}
+
+/* The reader's writer_pin: first use initializes the state and records the
+ * value's address; a later call from another address is a copy of a live Reader
+ * and is refused. Unlike the Writer, no pointer into the Goose value survives a
+ * call, so a copy is memory-safe — but both copies would decode from the same
+ * position and emit the same bytes twice, which is a bug worth a Status. */
+static int32_t reader_pin(GooseReader *r) {
+	if (!r) return ISAL_INVALID_STATE;
+	if (r->wrap > GS_WRAP_ZLIB) return ISAL_INVALID_STATE;
+	if (r->state > GS_R_FINISHED) return ISAL_INVALID_STATE;
+
+	if (r->state == GS_R_FRESH) {
+		if (r->pinned_self == (uint64_t)(uintptr_t)r) return COMP_OK;
+		if (r->pinned_self != 0) return ISAL_INVALID_STATE;
+		/* A Fresh Reader carrying `has_dict` with no address behind it is
+		 * deserialized or forged: the history the flag names was never copied
+		 * in, and re-initializing would decode against nothing. A pinned one is
+		 * the ordinary set_dict-then-read sequence and is fine. */
+		if (r->has_dict) return ISAL_INVALID_STATE;
+		struct inflate_state *s = reader_state(r);
+		isal_inflate_init(s);
+		/* reset keeps crc_flag; init clears it, so the wrapper is written
+		 * here, once, and survives every later reset. */
+		s->crc_flag = reader_flag(r->wrap);
+		r->pinned_self = (uint64_t)(uintptr_t)r;
+		return COMP_OK;
+	}
+
+	if (r->pinned_self != (uint64_t)(uintptr_t)r) return ISAL_INVALID_STATE;
+	return COMP_OK;
+}
+
+int64_t igzip_gs_reader_size(void) { return (int64_t)sizeof(GooseReader); }
+
+int32_t igzip_gs_reader_reset(GooseReader *r) {
+	if (!r) return ISAL_INVALID_STATE;
+	struct inflate_state *s = reader_state(r);
+	isal_inflate_reset(s);
+	/* Already true of isal_inflate_reset, and written anyway so the invariant
+	 * is local rather than three hundred lines away in ISA-L. */
+	s->crc_flag = reader_flag(r->wrap);
+	s->next_in = NULL;
+	s->next_out = NULL;
+	s->avail_in = 0;
+	s->avail_out = 0;
+	/* Dropping the pin is what lets a mid-stream copy recover: the next call
+	 * from either address re-initializes. `isal_inflate_reset` already leaves a
+	 * state init would (it differs from isal_inflate_init only in crc_flag,
+	 * hist_bits and the four per-call pointers), so this costs nothing worth
+	 * measuring: 3.9 ns against 3.4 ns per reset. */
+	r->pinned_self = 0;
+	r->state = GS_R_FRESH;
+	r->has_dict = false;
+	r->total_in = 0;
+	r->total_out = 0;
+	return COMP_OK;
+}
+
+/* "This member ended", which isal_inflate cannot say through its return code:
+ * it folds ISAL_END_INPUT into ISAL_DECOMP_OK and reports completion only in
+ * block_state. False for an unpinned or Fresh Reader, so a forged value can
+ * never claim a member ended. */
+bool igzip_gs_reader_finished(const GooseReader *r) {
+	if (!r || r->state != GS_R_OPEN) return false;
+	if (r->pinned_self != (uint64_t)(uintptr_t)r) return false;
+	const struct inflate_state *s = (const struct inflate_state *)(const void *)r->istate;
+	return s->block_state == ISAL_BLOCK_FINISH;
+}
+
+/* Legal before any input, and again in the one moment igzip allows after input
+ * has started: right after ISAL_NEED_DICT, when block_state is back at NEW_HDR
+ * and nothing has been emitted. igzip's own guard decides that; this call only
+ * adds the wrapper rule the Writer has. */
+int32_t igzip_gs_reader_set_dict(GooseReader *r, igzip_slice_u8 dict) {
+	int32_t rc = reader_pin(r);
+	if (rc != COMP_OK) return rc;
+	if (r->state == GS_R_FINISHED) return ISAL_INVALID_STATE;
+	if (r->wrap == GS_WRAP_GZIP) return ISAL_INVALID_STATE;
+	if (dict.len < 0 || dict.len > 0x7FFFFFF0) return STATELESS_OVERFLOW;
+
+	struct inflate_state *s = reader_state(r);
+	/* The moment is checked before the empty case, so set_dict("") mid-body is
+	 * BadState rather than a silent Ok. This is igzip's own guard from
+	 * isal_inflate_set_dict, asked here because an empty dictionary skips that
+	 * call: handing igzip a zero-length dictionary would reset the history
+	 * cursors, which is legal only where the call itself is. */
+	if (s->block_state != ISAL_BLOCK_NEW_HDR || s->tmp_out_processed != s->tmp_out_valid)
+		return ISAL_INVALID_STATE;
+	/* An empty dictionary is a no-op, as on a Writer: it cannot satisfy FDICT. */
+	if (dict.len == 0) return COMP_OK;
+
+	/* ISAL_INVALID_STATE is -3, the same value as ISAL_INVALID_LOOKBACK, but
+	 * on this path it cannot mean anything else than "not now". */
+	rc = isal_inflate_set_dict(s, (uint8_t *)(uintptr_t)dict.data, (uint32_t)dict.len);
+	if (rc != COMP_OK) return rc;
+
+	r->has_dict = true;
+	return COMP_OK;
+}
+
+/* One drain step against dst. `out_finished` is block_state == FINISH; on that
+ * state igzip has provably copied every decoded byte out, so nothing is ever
+ * staged at a member boundary. */
+int32_t igzip_gs_reader_step(GooseReader *r, igzip_slice_u8 src, igzip_slice_u8 dst,
+			     uint32_t *out_consumed, uint32_t *out_written, bool *out_finished) {
+	if (!r || !out_consumed || !out_written || !out_finished) return ISAL_INVALID_STATE;
+	if (src.len < 0 || src.len > 0x7FFFFFF0) return STATELESS_OVERFLOW;
+	if (dst.len < 0 || (uint64_t)dst.len > UINT32_MAX) return STATELESS_OVERFLOW;
+
+	int32_t rc = reader_pin(r);
+	if (rc != COMP_OK) return rc;
+	if (r->state == GS_R_FINISHED) return ISAL_INVALID_STATE;
+
+	struct inflate_state *s = reader_state(r);
+	s->next_in = src.len > 0 ? (uint8_t *)(uintptr_t)src.data : NULL;
+	s->avail_in = (uint32_t)src.len;
+	s->next_out = dst.len > 0 ? (uint8_t *)(uintptr_t)dst.data : NULL;
+	s->avail_out = (uint32_t)dst.len;
+
+	int32_t raw = (int32_t)isal_inflate(s);
+	/* A zlib member with FDICT reports ISAL_NEED_DICT once whatever the Reader
+	 * already holds: parsing the header is what notices. When a dictionary is
+	 * already in place that is not a request for anything, so decode on instead
+	 * of making every zlib reader learn this sequence. Bounded at two, because
+	 * wrapper_flag is set by the time the first call returns, so the code
+	 * cannot repeat inside one member. */
+	for (int again = 0; again < 2 && raw == ISAL_NEED_DICT && r->has_dict; again++)
+		raw = (int32_t)isal_inflate(s);
+
+	uint32_t consumed = (uint32_t)src.len - s->avail_in;
+	uint32_t written = (uint32_t)dst.len - s->avail_out;
+	bool done = s->block_state == ISAL_BLOCK_FINISH;
+
+	/* Borrowed input and output die with the call. */
+	s->next_in = NULL;
+	s->next_out = NULL;
+
+	/* isal_inflate only ever decrements avail_in and avail_out, so these cannot
+	 * exceed what was offered. Check anyway: the alternative is trusting a
+	 * counter written by code this file does not own with the length of a memcpy
+	 * into the caller's buffer. */
+	if (consumed > (uint32_t)src.len || written > (uint32_t)dst.len) {
+		r->state = GS_R_FINISHED;
+		*out_consumed = 0;
+		*out_written = 0;
+		*out_finished = false;
+		return ISAL_INVALID_STATE;
+	}
+
+	r->total_in += consumed;
+	r->total_out += written;
+	if (r->state == GS_R_FRESH) r->state = GS_R_OPEN;
+
+	int32_t out = reader_status(raw);
+	/* A terminal failure latches. Once block_state is FINISH, isal_inflate
+	 * returns ISAL_DECOMP_OK without touching the bytes, so without this a
+	 * caller that ignored the status would read Ok forever. ISAL_NEED_DICT is
+	 * a request, not a failure, and leaves the Reader Open for set_dict. */
+	if (out != COMP_OK && out != IGZIP_GS_NEED_DICT) r->state = GS_R_FINISHED;
+
+	*out_consumed = consumed;
+	*out_written = written;
+	*out_finished = done;
+	return out;
+}
+
+/* One member, in one call, into the caller's destination. avail_out is dst.len
+ * and nothing else: inflate has no output bound to compute, which is why this
+ * takes a slice where the stateless compressor writes at a builder's stack top.
+ * TooSmall leaves the Reader Fresh so a retry with a bigger slice is legal. */
+int32_t igzip_gs_reader_stateless(GooseReader *r, igzip_slice_u8 src, igzip_slice_u8 dst,
+				  uint32_t *out_consumed, uint32_t *out_written) {
+	if (!r || !out_consumed || !out_written) return ISAL_INVALID_STATE;
+	if (src.len < 0 || src.len > 0x7FFFFFF0) return STATELESS_OVERFLOW;
+	if (dst.len < 0 || (uint64_t)dst.len > UINT32_MAX) return STATELESS_OVERFLOW;
+
+	int32_t rc = reader_pin(r);
+	if (rc != COMP_OK) return rc;
+	if (r->state != GS_R_FRESH) return ISAL_INVALID_STATE;
+	/* isal_inflate_stateless documents no dictionary support; refuse rather
+	 * than rely on the history buffer surviving its partial reset. */
+	if (r->has_dict) return ISAL_INVALID_STATE;
+
+	struct inflate_state *s = reader_state(r);
+	s->next_in = src.len > 0 ? (uint8_t *)(uintptr_t)src.data : NULL;
+	s->avail_in = (uint32_t)src.len;
+	s->next_out = dst.len > 0 ? (uint8_t *)(uintptr_t)dst.data : NULL;
+	s->avail_out = (uint32_t)dst.len;
+
+	int32_t raw = (int32_t)isal_inflate_stateless(s);
+	uint32_t consumed = (uint32_t)src.len - s->avail_in;
+	uint32_t written = (uint32_t)dst.len - s->avail_out;
+
+	s->next_in = NULL;
+	s->next_out = NULL;
+
+	if (consumed > (uint32_t)src.len || written > (uint32_t)dst.len) {
+		r->state = GS_R_FINISHED;
+		*out_consumed = 0;
+		*out_written = 0;
+		return ISAL_INVALID_STATE;
+	}
+
+	int32_t out = reader_status(raw);
+	if (out == IGZIP_GS_TOO_SMALL) {
+		/* A retry re-decodes this src from the start, so counting these bytes
+		 * would count them twice -- and the decode state is mid-member, which
+		 * is not what "Fresh" should mean. A caller is then free to either
+		 * retry `inflate` with a bigger slice or switch to `read`, and both
+		 * start from a clean state. */
+		isal_inflate_reset(s);
+		s->crc_flag = reader_flag(r->wrap);
+		s->next_in = NULL;
+		s->next_out = NULL;
+		r->state = GS_R_FRESH;
+	} else {
+		r->state = GS_R_FINISHED;
+		r->total_in += consumed;
+		r->total_out += written;
+	}
+
+	*out_consumed = consumed;
+	*out_written = written;
+	return out;
 }

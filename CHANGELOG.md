@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.3.0 — 2026-11-14
+
+The other half of the codec: the package now reads what it writes, and its own
+tests no longer need an external decoder.
+
+### Added
+
+- `Reader` — a 152,936-byte streaming inflater with `gzip_reader` /
+  `zlib_reader` / `raw_reader` / `reader`. `read` appends the decoded bytes and
+  returns how many of the input's bytes it consumed, because decompression stops
+  at a member boundary and leaves the rest of the slice alone. `finished` reports
+  that boundary, `finish` closes the body, `reset` starts the next member.
+  Inputs above `MAX_INPUT` are split into windows inside `read`; `read_windowed`
+  exposes the window size.
+- `inflate` — one member into a caller-sized slice, returning
+  `consumed, written, Status`, and the only verb that reports `TooSmall`.
+  `inflated` decodes every member in a buffer into a new one, through the
+  streaming path so a dictionary works there too.
+- `Status.Truncated`, `TooSmall`, `NeedDict`, `Corrupt` and `BadChecksum`, plus
+  `reader_size()`. Truncated input is its own status, never corruption, and a
+  terminal error latches the reader rather than leaving it able to answer `Ok`
+  from a dead stream.
+- `set_dict` on a reader, legal in `Fresh` and again immediately after
+  `NeedDict`. igzip never compares a dictionary with the stream's DICTID, so a
+  wrong one surfaces at the trailer — or, on a raw stream, not at all. That is
+  documented on the function and pinned by a test.
+- `read_gzip_header` / `read_zlib_header` → `GzipInfo` / `ZlibInfo`, which close
+  the last capability gap against `igzip_lib.h`: the container can now be read as
+  well as written. The parts (name, comment, extra, and where the deflate stream
+  starts) are reported as offsets into the caller's buffer — no copy, no view to
+  dangle — and every length in an untrusted header is checked against the bytes
+  present. `docs/coverage.md` maps the whole `igzip_lib.h` surface, including
+  what is deliberately left out and why.
+- `test/roundtrip.goose` (every wrapper, level, size and chunk size, decoded ten
+  ways), `test/inflate_contract.goose` (the transition matrix, statuses,
+  dictionaries, hostile input), `test/header_contract.goose` (headers both
+  directions, and every malformed one), `scripts/read_stress.c`
+  (AddressSanitizer over every truncation offset, 400 mutations and the
+  dictionary paths), and reader coverage in the streaming, writer-contract,
+  threading and 4.2 GiB tests.
+
+### Changed
+
+- `make test` no longer needs Python: every stream the tests write is decoded by
+  the package itself. `scripts/check_gzip.py` moves to `make crosscheck`, the
+  independent decoder that `make verify` runs when `python3` is installed.
+- `test/large_stream.goose` round-trips its 4.2 GiB: each compressed chunk goes
+  from `write` straight into `read`, and `Reader.total_out` (a `u64`) is checked
+  past igzip's 32-bit `total_out`.
+- `test/contract.goose`, `test/streaming.goose` and
+  `test/writer_contract.goose` decode their own artifacts as they write them.
+- `examples/gzip_file.goose` reads its output back before reporting success.
+- `status_name(BadState)` says "this state" rather than "this writer state".
+- The documentation was split by audience: `README.md` is the front page and the
+  API tables, `docs/guide.md` is how to use it, `docs/coverage.md` is what igzip
+  exposes and what this package does with it, `docs/verification.md` is what the
+  tests prove, and `docs/internals.md` stays for maintainers.
+
 ## 0.2.0 — 2026-11-13
 
 Streaming deflate, custom headers, preset dictionaries, and inputs beyond the
@@ -88,7 +146,6 @@ follow — state in Goose values, typed `Status`, the caller's choice of buffer.
 - ISA-L 2.32.1 is vendored as a pinned submodule and built with CMake, so
   nothing is installed system-wide. Building needs git, cmake, nasm and a C
   compiler.
-- libdeflate is out of scope, permanently.
 - Inputs above `MAX_INPUT` are rejected rather than truncated.
 - A `HuffTables` value that was never built, or was deserialized from storage,
   is validated before igzip sees it: a bogus header length returns
