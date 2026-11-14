@@ -44,9 +44,9 @@ fn streamed_chunks(body: const u8[:], chunks: const i64[:]) -> u8[>..] {
     return out;
 }
 
-// The one-shot and streaming paths are byte-identical at the sizes the design
-// measured. Below the 32 KiB internal buffer the two shapes are allowed to
-// differ (both are valid gzip); the chunking and flush tests cover those.
+// The one-shot and streaming paths are byte-identical at and above the 32 KiB
+// internal buffer. Below it the two shapes are allowed to differ (both are valid
+// gzip); the chunking and flush tests cover those.
 fn test_equivalence() {
     var sizes: i64[4] = [32768, 65536, 120233, 316560];
     let wraps: igzip::Wrapper[3] = [igzip::Wrapper.Raw, igzip::Wrapper.Gzip, igzip::Wrapper.Zlib];

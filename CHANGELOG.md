@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.1 — 2026-11-14
+
+A test-suite fix; no library behaviour changed.
+
+### Fixed
+
+- `test/writer_contract.goose`'s tiny-destination case asserted that a level-1
+  `Writer` driven through an 8-byte destination produced byte-identical output
+  to a one-shot `Compressor` for a 16 KiB body. That equality is not part of the
+  contract: below the 32 KiB internal buffer the two spellings may choose
+  different block boundaries, and an 8-byte destination also sends igzip through
+  its staging buffer. It failed on windows-x64 on a run that changed no code.
+  The case now asserts that the stream decodes back to the body, which is what
+  it is for.
+
 ## 0.4.0 — 2026-11-14
 
 ### Changed (breaking)
