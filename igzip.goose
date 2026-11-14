@@ -17,7 +17,7 @@
 //   var r = igzip::gzip_reader();
 //   let used, err = r.read(gz, body);          // appends; reports consumption
 //   guard r.finished() else { /* feed more */ };
-//   guard r.finish().ok() else { /* truncated */ };
+//   guard r.finish() else { /* truncated */ };
 //
 // Four rules hold the shape together:
 //
