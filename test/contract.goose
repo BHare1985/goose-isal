@@ -112,7 +112,13 @@ fn test_independent_compressors(body: const u8[:]) {
     let gb, err_b = b.compressed(body);
     assert(err_a == true && err_b);
     assert(ga.len == gz1(body));
-    assert(gb.len <= ga.len);
+    assert(gb.len <= igzip::bound(body.len));
+
+    // Independence means both streams decode to the body, not that level 3 is
+    // smaller: levels are different algorithms, and how they compare is a
+    // property of the kernels for the target. An ordering assertion here tests
+    // ISA-L's tuning, and the aarch64 build does not satisfy it for this body.
+    assert(decodes_to(ga, body) == true && decodes_to(gb, body));
 }
 
 fn test_wrappers(body: const u8[:]) {
@@ -128,19 +134,20 @@ fn test_wrappers(body: const u8[:]) {
     assert(z.len < gz1(body));
 }
 
+// Every level works and decodes back to the same bytes. Deliberately no size
+// ordering between levels: level 3 is a different algorithm (icf), not level 1
+// with a quality dial, and it comes out *larger* than level 1 on some bodies --
+// on aarch64 with this corpus, and on the event log in docs/guide.md (34.1%
+// against 34.0%). Ordering is ISA-L's tuning, not this package's contract.
 fn test_levels(body: const u8[:]) {
-    var sizes: i64[4] = [0; 4];
     for level in 4 {
         var c = igzip::gzip_compressor(level as i32);
         let out, err = c.compressed(body);
         assert(err);
         assert(out.len < body.len);
         assert(out.len <= igzip::bound(body.len));
-        sizes[level] = out.len;
+        assert(decodes_to(out, body));
     }
-    // The slower levels never come out larger on the same body.
-    assert(sizes[3] <= sizes[1]);
-    assert(sizes[1] <= sizes[0]);
 }
 
 // Sizes that sit on deflate's seams: empty, one byte, a stored-block header's
@@ -347,6 +354,14 @@ fn test_empty() {
 // Every artifact scripts/check_gzip.py expects, written from one place so the
 // tests above stay pure assertions. The checker discovers these by name, so a
 // new case here needs no Python change.
+// One member, decoded in memory: the assertion every level and compressor
+// comparison needs, without writing an artifact.
+fn decodes_to(stream: const u8[:], want: const u8[:]) -> bool {
+    var r = igzip::gzip_reader();
+    let out, err = r.inflated(stream);
+    return err && support::same(out, want);
+}
+
 // The self-hosting half: this package reads back what it wrote. Assertion
 // messages name the artifact, so a failure says which stream is wrong.
 fn decode_is(what: const u8[:], wrap: igzip::Wrapper, stream: const u8[:], want: const u8[:]) {

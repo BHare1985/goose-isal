@@ -45,7 +45,11 @@ let BOX = 65536;
 struct RoundBox {
     records: i32,
     len:     i32,
-    data:    u8[BOX],
+    // The checksum of the body this member was made from. The reader worker
+    // rebuilds that body itself, so on a mismatch this says which side is
+    // wrong: the bytes it generated, or the bytes it decoded.
+    sum:  i64,
+    data: u8[BOX],
 }
 
 struct RoundResult {
@@ -144,6 +148,10 @@ thread_fn reader_worker() {
 
         body.clear();
         make_body(body, box.records);
+        // Generated twice, on purpose, while the Windows difference is open: if
+        // the two disagree the first body was overwritten between the calls.
+        var body2: u8[>..] = [];
+        make_body(body2, box.records);
         out.clear();
         let used, err = holder[0].read(box.data[..box.len], out);
         var code: i32 = 0;
@@ -153,7 +161,9 @@ thread_fn reader_worker() {
             code = 2;
         } else if !same_bytes(out, body) {
             // Say how it diverged: a different length points at the box or the
-            // queue, a same-length difference at the decode itself.
+            // queue, a same-length difference at the decode itself. `box.sum`
+            // is the body the member was made from, so whichever of `out` and
+            // `body` matches it is the one that is right.
             var at: i64 = -1;
             var k:  i64 = 0;
             while k < out.len && k < body.len {
@@ -161,7 +171,11 @@ thread_fn reader_worker() {
                 k++;
             }
             print("threads: mismatch records=", box.records, " box.len=", box.len,
-                  " out.len=", out.len, " body.len=", body.len, " at=", at);
+                  " out.len=", out.len, " body.len=", body.len, " at=", at,
+                  " box.sum=", box.sum, " out.sum=", checksum(out),
+                  " body.sum=", checksum(body), " body2.sum=", checksum(body2));
+            show_around("  out", out, at);
+            show_around("  body", body, at);
             code = 3;
         } else if !holder[0].finish() {
             code = 4;
@@ -174,6 +188,28 @@ thread_fn reader_worker() {
             code:    code,
         });
     }
+}
+
+// A position-sensitive checksum, so two bodies that differ anywhere do not
+// collide by accident: i64 arithmetic, no wrap, the same function on both
+// sides of the comparison.
+fn checksum(xs: const u8[:]) -> i64 {
+    var h: i64 = 0;
+    for x in xs { h = (h * 31 + x) % 1000000007; }
+    return h;
+}
+
+// A log with no hexdump, for the bytes either side of the first difference.
+fn show_around(tag: const u8[:], xs: const u8[:], at: i64) {
+    guard at >= 0 else { return; }
+    var from = at - 8;
+    if from < 0 { from = 0; }
+    var to = at + 16;
+    if to > xs.len { to = xs.len; }
+    var line: u8[>..] = [];
+    format(line, tag, " [", from, "..", to, "):");
+    for i in from..to { format(line, " ", xs[i] as i64); }
+    print(line);
 }
 
 // Byte equality, local to this file: threads.goose does not import the support
@@ -217,7 +253,12 @@ fn main() {
         assert(w.finish(member));
         assert(w.reset());
         assert(member.len <= BOX);
-        var box = RoundBox { records: records as i32, len: member.len as i32, .. };
+        var box = RoundBox {
+            records: records as i32,
+            len:     member.len as i32,
+            sum:     checksum(body),
+            ..
+        };
         box.data[..member.len].move_from(member[..]);
         qput(box);
     }

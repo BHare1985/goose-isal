@@ -139,9 +139,12 @@ jobs:
         run: |
           set -euo pipefail
           goose build test/threads.goose -o "$RUNNER_TEMP/threads.exe"
-          out=$("$RUNNER_TEMP/threads.exe" 2>&1) && echo "$out" || {
-            echo "::warning title=threads on Windows::$(tr '\n' ' ' <<< "$out" | tail -c 400)"
-          }
+          # The run's own output goes to the log in full: its mismatch line is
+          # the whole point of this step while the difference is open, and a
+          # warning annotation would truncate it.
+          if ! "$RUNNER_TEMP/threads.exe"; then
+            echo "::warning title=threads on Windows::the reader worker decoded the wrong bytes; its diagnostics are above"
+          fi
 
       - name: 4.2 GiB round trip (native)
         if: runner.os != 'Windows'

@@ -295,6 +295,12 @@ Numbers, on an event-log API serving 1.9 KB responses (`make bench` reproduces i
 At 9.4 KB per response: 20.5% at 19 µs for level 1, **20.8% at 11 µs** for the
 trained table. Same bytes out, 3.8x and 1.6x less time in.
 
+The levels are different algorithms, not one algorithm with a quality dial.
+Level 3 is slower and is not always smaller: it is a tenth of a point behind
+level 1 on the table above, and on aarch64 it comes out larger on the test
+corpus. Treat a level as a speed/ratio point to measure on your own data, and
+never assert an ordering between levels -- this package's tests do not.
+
 ## Threads and memory
 
 - No globals and no mutable statics in the shim, so two values in two threads
