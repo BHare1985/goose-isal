@@ -1,14 +1,15 @@
 # Changelog
 
-## 0.4.0 — unreleased
+## 0.4.0 — 2026-11-14
 
 ### Changed (breaking)
 
 - **A call that can fail returns a `bool`, with its data in front of it** —
   `let used, ok = r.read(..)`, `let gz, ok = c.compressed(..)` — and the reason is
-  out of band, in the two accessors `goose_gfx` uses: `igzip::error()` for text,
-  `igzip::status()` for the `Status`. `Status` lost its `Ok` variant (it is *why
-  a call failed*) and `ok()` is gone.
+  reported out of band by `igzip::status()`, which returns a `Status` to branch
+  on, and `igzip::error()`, which returns text for a message. `Status` lost its
+  `Ok` variant, since it now describes why a call failed, and `ok()` was
+  removed.
 
   ```goose
   guard w.finish(out) else { abort(str("finish failed: ", igzip::error())); };
@@ -25,32 +26,45 @@
   `igzip::status()` returns a plain `Status` — `Ok` when the call succeeded — so
   a caller branches on it directly, with no optional to unwrap.
 
-  Migrating: `guard x.ok()` becomes `guard x else`, `assert(e == Status.Ok)`
+  To migrate: `guard x.ok()` becomes `guard x else`, `assert(e == Status.Ok)`
   becomes `assert(e)`, and a specific failure is `assert(!e)` followed by
-  `assert(igzip::status() == Status.X)`. Every call records its outcome and
+  `assert(igzip::status() == Status.X)`. Every call records its outcome and a
   success clears the record, so `status()` is `Ok` exactly when the bool was
   true. The record is per thread, so a worker's failure is its own.
 - `Status` implements `format`, so `print(err)` needs no `status_name` call.
 
-- **`bound(n)` returns `0` when there is no bound to give** — a negative length,
-  or one so large that the bound would not fit in the 32 bits igzip's lengths
-  use. It used to clamp to `0x7FFFFFF0`, which for an input of about 2 GiB is a
-  "bound" no larger than the input, and a stored block of incompressible input
-  can overrun that.
+- **`bound(n)` returns `0` when no bound exists**: a negative length, or one so
+  large that the bound would not fit in the 32 bits igzip's lengths use.
+  Previously it clamped to `0x7FFFFFF0`, which for an input near 2 GiB returned a
+  bound no larger than the input; a stored block of incompressible data can
+  exceed that, so the clamped value was not safe to use as a limit.
 
-### Internals
+### Added
 
-- The C boundary refuses a slice whose length is non-zero and whose data pointer
-  is null, at every entry point that dereferences one. Goose cannot build such a
-  value and `from_bytes` rejects one, but the shim is a C API as well.
-- The per-thread status (`_Thread_local` in `src/igzip_shim.c`) is the one piece
-  of mutable state in the package, and the one exception to the shim's
-  no-statics rule. It is per thread, written by every fallible call and read only
-  by `status()` / `error()`.
+- A CI workflow that builds, runs and independently decodes on every platform
+  Goose publishes a compiler for: linux-x64, macos-x64, macos-arm64 and
+  windows-x64. It runs the typecheck, the JIT suites, the native thread test, the
+  4.2 GiB stream test where the runner can carry it, the AddressSanitizer
+  harnesses, and the CPython decoder.
+
+### Removed
+
+- The design briefs for 0.2.0 and 0.3.0. The measured ISA-L behaviours they
+  recorded are in [docs/internals.md](docs/internals.md), the reader's transition
+  matrix with them, and user-facing rationale in [docs/guide.md](docs/guide.md).
+
+### Implementation
+
+- The C boundary rejects a slice whose length is non-zero and whose data pointer
+  is null, at every entry point that dereferences one. Goose cannot construct
+  such a value and `from_bytes` rejects one, but the shim is also a C API.
+- The per-thread status (`_Thread_local` in `src/igzip_shim.c`) is the only
+  mutable state in the package. It is written by every fallible call and read
+  only by `status()` and `error()`.
 - Every ISA-L number the two status tables are keyed on is `_Static_assert`ed.
-- Four defensive count checks in the shim: the memcpy length and the builder's
-  stack top come from a checked number rather than one written by code the shim
-  does not own.
+- Four count checks in the shim compare a length or a stack top taken from
+  igzip against the buffer it was given, rather than trusting a value written by
+  code this package does not own.
 
 ## 0.3.0 — 2026-11-14
 
@@ -108,7 +122,7 @@ tests no longer need an external decoder.
 - The documentation was split by audience: `README.md` is the front page and the
   API tables, `docs/guide.md` is how to use it, `docs/coverage.md` is what igzip
   exposes and what this package does with it, `docs/verification.md` is what the
-  tests prove, and `docs/internals.md` stays for maintainers.
+  tests prove, and `docs/internals.md` covers maintenance.
 
 ## 0.2.0 — 2026-11-13
 
@@ -160,8 +174,8 @@ one-shot 2 GiB limit.
 
 ### Notes
 
-- A copy of an initialized `Writer` is rejected with `Status.BadState`; the copy's C pointers
-  would point into the original. `reset` recovers it.
+- A copy of an initialized `Writer` is rejected with `Status.BadState`, because
+  the copy's C pointers would point into the original. `reset` recovers it.
 - ISA-L level 0 in the stateful path ends one stored byte differently from the
   stateless path. Levels 1-3 are byte-identical; level 0 remains a valid stream.
 - `isal_deflate_set_dict` copies the last 32 KiB; the dictionary slice does not
