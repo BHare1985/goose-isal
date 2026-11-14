@@ -34,17 +34,7 @@ version keeps the same shape:
 
 The training path exists because a table trained on one class of body beats
 both level 0's default table and, at far higher speed, the ratio of level 1.
-Numbers are in the README.
-
-## 0.1.x — hardening the same surface
-
-No new API; what real traffic finds.
-
-- A fuzz harness: random inputs and lengths across every level and wrapper,
-  inflated and compared, under `--debug`.
-- Re-run `make stress` per ISA-L release, so `ISAL_BOUND_MARGIN` stays proven
-  rather than assumed.
-- Decide whether `bound()` should account for multi-member buffers.
+The measurements are in [docs/guide.md](docs/guide.md).
 
 ## Shipped: 0.2.0 — streaming deflate and gzip header control
 
@@ -81,47 +71,55 @@ and read a container header, train a table, and set a dictionary.
 | Errors | `Truncated`, `TooSmall`, `NeedDict`, `Corrupt`, `BadChecksum`; a terminal error latches the reader |
 | Tests | `test/roundtrip.goose`, `test/inflate_contract.goose`, `test/header_contract.goose`, `scripts/read_stress.c`, a 4.2 GiB round trip, and `make test` no longer needing Python |
 
-Five facts the implementation is built on, all measured rather than assumed:
-completion is `block_state == ISAL_BLOCK_FINISH` and not a return code (igzip
-folds `ISAL_END_INPUT` into success); `FINISH` is only set once the staging buffer
-is provably empty; the two halves of the codec collide on `-1` and `-3`, so the
-shim translates inflate's codes into their own range; `isal_inflate_stateless` is
-honest about `avail_out` where `isal_deflate_stateless` is not; and a corrupted
-payload usually surfaces as `Ok` with the member unfinished, which is why
-`finish` exists.
+Five behaviours underlie the implementation, each measured against the
+vendored pin: completion is `block_state == ISAL_BLOCK_FINISH` and not a return
+code, because igzip folds `ISAL_END_INPUT` into success; `FINISH` is only set once
+the staging buffer is provably empty; the two halves of the codec collide on `-1`
+and `-3`, so the shim translates inflate's codes into their own range;
+`isal_inflate_stateless` respects `avail_out` where `isal_deflate_stateless` does
+not; and a corrupted payload usually surfaces as `Ok` with the member unfinished,
+which is why `finish` exists.
 
-`docs/coverage.md` is the map from `igzip_lib.h` to this package, including the
-four things deliberately left out and why.
+`docs/coverage.md` is the map from `igzip_lib.h` to this package, including
+what is left out and why.
 
-### What is not in 0.3.0, and not coming
+## Shipped: 0.4.0 — the shape of failure, and a four-platform CI
 
-**Checksums.** The plan had a 0.4.0 for `crc32_gzip_refl` and `isal_adler32`. It
-is dropped rather than deferred. igzip verifies a gzip or zlib trailer itself,
-so a caller already learns whether a stream is intact from the `Reader`; a caller
-who wants a CRC *value* wants a checksum library, and `crc.h` also holds `crc16`,
-`crc64` and `crc32c`, which no gzip stream needs. The boundary this package keeps
-is: it verifies checksums, it does not compute them. Reasoning in
-[docs/coverage.md](docs/coverage.md#the-checksum-decision).
+No new codec capability. A call that can fail now returns a `bool` with its data
+in front of it, and the reason is carried out of band:
 
-Also out by decision, all additive and all listed with their cost in
-[coverage.md](docs/coverage.md): subset Huffman tables, the preprocessed
-dictionary cache, and `IGZIP_HUFFTABLE_STATIC`.
+- `let used, ok = r.read(..)` and `let gz, ok = c.compressed(..)`; the reason is
+  `igzip::status()` for a `Status` to branch on and `igzip::error()` for text.
+  `Status` lost its `Ok` variant and `ok()` is gone, because a `Status` now means
+  *why a call failed*.
+- Every call records its outcome, so `status()` is `Ok` exactly when the bool was
+  true. The record is per thread, so a worker's failure is its own.
+- `bound(n)` returns `0` when there is no bound to give: a negative length, or
+  one whose bound would not fit igzip's 32-bit lengths. It no longer clamps,
+  which for an input near 2 GiB produced a bound no larger than the input.
+- The C boundary refuses a non-empty slice with a null data pointer at every
+  entry point that dereferences one.
+- CI builds, runs and independently decodes on all four platforms Goose ships a
+  compiler for: linux-x64, macos-x64, macos-arm64 and windows-x64. The
+  AddressSanitizer harnesses and the CPython decoder run there too, not only
+  locally.
+- The design briefs were retired; what a maintainer needs from them now lives in
+  [docs/internals.md](docs/internals.md) and [docs/guide.md](docs/guide.md).
 
-## Tech debt and TODOs
+## Known gaps
 
-Known gaps, roughly in the order they are worth picking up.
+Open work, roughly in the order it is useful to address.
 
 | Item | What it is | Why it matters |
 |---|---|---|
-| Goose v2026.4 miscompile on windows-x64 | In `test/threads.goose`, the body the *main thread* compressed was wrong while the identical function inside a `thread_fn` produced the right bytes. The first `format`-driven build of a growable body from an empty buffer in `main` is correct; every later one leaves literal fragments at wrong offsets and NUL holes -- same length, first difference at byte 15. The decoded bytes matched the main thread's own checksum and igzip had verified the gzip trailer, so the codec and the queue were correct. The test builds its largest body once and slices prefixes, and the reader worker still regenerates each body from scratch, so a wrong body fails. Details in [docs/internals.md](docs/internals.md). | An upstream compiler bug, not a package bug: the corruption is already in `main` before any thread or writer is involved. Until it is fixed in `aardappel/goose`, a Windows `main` should not build the same growable buffer in a second call. |
-| macOS runner supply | Both macOS legs run (`macos-15`, `macos-15-intel`). Intel images are queued for long periods and are being retired; `macos-15-intel` is the last x64 image. | A macOS job that waits, or is cancelled before a runner is assigned, is runner availability rather than this workflow. The Linux and Windows legs run anywhere. |
-| `make test-large` skipped on Windows | the 4.2 GiB round trip runs everywhere else | it takes longer than a job is worth there; revisit if Windows throughput matters |
-| Extern-signature parity is unchecked | `_Static_assert`s pin every layout, but nothing pins a `extern fn` declaration against the C definition: a mismatched arity or type links and passes garbage. `goose_gfx/test/api_check.py` does this by parsing both sides | the one boundary check `goose_gfx` has that this package does not. A Goose test reading `igzip.goose` and `src/igzip_shim.c` would keep `make test` python-free |
-| Streamed failures do not travel with the value | `igzip::status()` is per thread and describes the *call*, so a helper taking `r: Reader&` cannot report *r's* reason | a latched `status` field on `Writer`/`Reader` fixes it at +8 bytes each and a bump of the pinned asserts. Deliberate omission, not an oversight |
-| Error-return shape is still contested | The `const Status?` variant and the current `bool` plus `status()` were both built and tested during 0.4.0 | One of the two should be chosen; carrying both designs is a maintenance trap |
-| No fuzz target | `make stress` mutates a fixed corpus under ASan rather than fuzzing | the reader is the package's untrusted-input surface; libFuzzer over `inflate`/`read` would find what a fixed mutation set cannot |
-| ISA-L bump is manual | checkout the tag, update `EXPECTED_ISA_L`, run verify and stress (docs/internals.md) | the procedure is written down but nothing enforces that it was followed |
-| Doc snippets are compiled by hand | every snippet in README and guide was compiled against the package before a release, but nothing does it automatically | a doc example that stops compiling is invisible until someone tries it |
+| Goose v2026.4 miscompile on windows-x64 | Goose v2026.4's MSVC output miscompiles a second `format`-driven build of a growable buffer in a Windows `main`: the first build from an empty buffer is correct, later ones contain literal fragments at wrong offsets. The corruption is present before any thread or writer is involved, and the same function in a `thread_fn` is correct. `test/threads.goose` builds its body once and slices it, so the defect is not on the tested path. | This is an upstream compiler defect, not a defect in this package. Until it is fixed in `aardappel/goose`, a Windows `main` should not fill the same growable buffer in a second call. |
+| macOS runner availability | Both macOS jobs run (`macos-15`, `macos-15-intel`). Intel images are queued for long periods and are being retired; `macos-15-intel` is the last x64 image. | A macOS job that waits, or is cancelled before a runner is assigned, reflects runner availability rather than this workflow. The Linux and Windows jobs run on any hosted image. |
+| `make test-large` is skipped on Windows | The 4.2 GiB round trip runs on every other platform. | It takes longer than the Windows job justifies. It can be enabled if Windows throughput becomes a target. |
+| `extern fn` signatures are not checked against C | `_Static_assert`s pin every layout, but no check compares an `extern fn` declaration with its C definition: a mismatched arity or type links and passes garbage. | A check generated from both sides would close the last boundary gap and keep `make test` free of Python. |
+| Streamed failures do not travel with the value | `igzip::status()` is per thread and describes the *call*, so a helper taking `r: Reader&` cannot report that reader's reason. | A latched `status` field on `Writer` and `Reader` would fix it at 8 bytes each, at the cost of a bump to the pinned sizes. This is a deliberate omission. |
+| No fuzz target | `make stress` mutates a fixed corpus under AddressSanitizer rather than fuzzing. | The reader is the package's untrusted-input surface; libFuzzer over `inflate` and `read` would find inputs a fixed mutation set cannot. |
+| ISA-L upgrades are manual | The tag is checked out, `EXPECTED_ISA_L` is updated, and `make verify` plus `make stress` are run. | The procedure is documented in `docs/internals.md`, but nothing enforces that it was followed. |
+| Documentation snippets are compiled by hand | Every snippet in the README and guide is compiled against the package before a release. | Nothing does this automatically, so a snippet that stops compiling is invisible until a reader tries it. |
 
 ## 1.0.0 — stable
 
@@ -133,9 +131,9 @@ Known gaps, roughly in the order they are worth picking up.
 
 ## Out of scope
 
-These are ISA-L, but they are not igzip, and folding them in would make the
-package name a lie. Each wants its own package, with its own audience and its
-own API shape:
+These are part of ISA-L but not part of igzip. Including them would make the
+package something other than what its name says, and each deserves its own
+package, audience and API shape:
 
 | Area | Why not here |
 |---|---|

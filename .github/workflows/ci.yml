@@ -2,8 +2,8 @@
 #
 # Four targets, because that is what exists: Goose publishes linux-x64,
 # macos-x64, macos-arm64 and windows-x64. There is no linux-arm64 build of the
-# compiler, so that target would mean building Goose from source -- a different
-# project, and not something this workflow should smuggle in.
+# compiler, so that target would mean building Goose from source, which is a
+# different project and out of place in this workflow.
 #
 # ISA-L itself is fine on all four: its CMake picks nasm's format per platform
 # (elf64 / macho64 / win64) and has aarch64 kernels for Apple Silicon.
@@ -12,6 +12,12 @@
 # a separate pool: those jobs can wait in the queue, or be cancelled before a
 # runner is assigned, and that is runner availability rather than this workflow.
 # The Linux and Windows legs run anywhere.
+#
+# A change that touches only prose cannot break the build, so those pushes and
+# pull requests do not start a run: the list above is markdown, docs assets and
+# licence/gitignore. The workflow file itself is not on the list, so a change to
+# this file is always exercised. Nothing on `main` requires a status check, so a
+# documentation-only pull request is not left waiting for one that will not run.
 #
 # What each job proves: the package typechecks, the C compiles against the
 # vendored ISA-L (which is the part that differs per platform -- assembly
@@ -24,7 +30,13 @@ name: ci
 on:
   push:
     branches: [main]
+    paths-ignore: &docs
+      - "**.md"
+      - "docs/**"
+      - LICENSE
+      - .gitignore
   pull_request:
+    paths-ignore: *docs
   workflow_dispatch: # so a branch can be exercised without opening a PR
 
 permissions:
