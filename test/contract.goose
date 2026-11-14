@@ -357,6 +357,8 @@ fn decode_is(what: const u8[:], wrap: igzip::Wrapper, stream: const u8[:], want:
 }
 
 fn write_artifacts(body: const u8[:]) {
+    assert(make_dir("build"));
+    assert(make_dir("build/tmp"));
     assert(make_dir(TMP));
     assert(write_file(str(TMP, "/body.txt"), body));
 

@@ -647,6 +647,8 @@ fn main() {
     let tables, built = t.build();
     assert(built);
 
+    assert(make_dir("build"));
+    assert(make_dir("build/tmp"));
     assert(make_dir(TMP));
     test_layout();
     test_state_and_totals(body);

@@ -237,6 +237,8 @@ fn test_medium() {
 }
 
 fn write_artifacts(body: const u8[:]) {
+    assert(make_dir("build"));
+    assert(make_dir("build/tmp"));
     assert(make_dir(TMP));
     assert(write_file(str(TMP, "/body.txt"), body));
 
@@ -265,6 +267,8 @@ fn main() {
     support::corpus(body, 3000);
     assert(body.len > 20000);
 
+    assert(make_dir("build"));
+    assert(make_dir("build/tmp"));
     assert(make_dir(TMP));
     test_equivalence();
     test_chunked();
