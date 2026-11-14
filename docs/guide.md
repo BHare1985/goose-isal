@@ -44,10 +44,10 @@ bound, which is what `inflate` and `TooSmall` exist for.
 var w = igzip::zlib_writer(1);
 var out: u8[>..] = [];
 
-guard w.write(header_json, out).ok() else { abort("write failed"); };
-guard w.flush(out).ok() else { abort("flush failed"); };   // a decode point
-guard w.write(rows_json, out).ok() else { abort("write failed"); };
-guard w.finish(out).ok() else { abort("finish failed"); };
+if !w.write(header_json, out) { abort("write failed"); };
+if !w.flush(out) { abort("flush failed"); };   // a decode point
+if !w.write(rows_json, out) { abort("write failed"); };
+if !w.finish(out) { abort("finish failed"); };
 ```
 
 The lifecycle is `Fresh → HeaderWritten → Open → Flushed → Finished`, with
@@ -75,10 +75,10 @@ input.
 var r = igzip::gzip_reader();
 var body: u8[>..] = [];
 
-let used, err = r.read(gz, body);
-guard err.ok() else { abort(igzip::status_name(err)); };
+let used, ok = r.read(gz, body);
+if !ok { abort(str("read failed: ", igzip::error())); };
 guard r.finished() else { abort("member is incomplete: feed more"); };
-guard r.finish().ok() else { abort("truncated"); };
+if !r.finish() { abort("truncated"); };
 ```
 
 `read` returns a count as well as a status because decompression does not consume
@@ -107,14 +107,14 @@ cannot go on reading `Ok` out of a dead stream. `finish` after such an error is
 ```goose
 var pos: i64 = 0;
 loop {
-    let used, err = r.read(all[pos..], body);
-    guard err.ok() else { abort(igzip::status_name(err)); };
+    let used, ok = r.read(all[pos..], body);
+    if !ok { abort(str("read failed: ", igzip::error())); };
     pos += used;
     if !r.finished() { break; }
     if pos == all.len { break; }
-    guard r.reset().ok() else { abort("reset failed"); };
+    if !r.reset() { abort("reset failed"); };
 }
-guard r.finish().ok() else { abort("truncated"); };
+if !r.finish() { abort("truncated"); };
 ```
 
 `inflated(src)` runs that loop for you and joins the members. Trailing garbage
@@ -159,9 +159,9 @@ var w = igzip::gzip_writer(1);
 var out: u8[>..] = [];
 let hdr = igzip::GzipHeader { os: 3, name: "report.csv", mtime: 0 };
 
-guard w.write_gzip_header(hdr, out).ok() else { abort("header failed"); };
-guard w.write(body, out).ok() else { abort("write failed"); };
-guard w.finish(out).ok() else { abort("finish failed"); };
+if !w.write_gzip_header(hdr, out) { abort("header failed"); };
+if !w.write(body, out) { abort("write failed"); };
+if !w.finish(out) { abort("finish failed"); };
 ```
 
 `mtime` defaults to 0 and `os` to 0xff, so a header left alone is reproducible.
@@ -183,8 +183,8 @@ buffer without decoding or copying anything. They report the fields and the
 *offsets* of the optional parts, so a caller slices the input it already has:
 
 ```goose
-var info, err = igzip::read_gzip_header(gz);
-guard err.ok() else { abort(igzip::status_name(err)); };
+var info, ok = igzip::read_gzip_header(gz);
+if !ok { abort(str("header failed: ", igzip::error())); };
 
 let name = gz[info.name_at..][..info.name_len];   // name_at is -1 when absent
 let body = gz[info.body_at..];                    // the deflate stream
@@ -216,9 +216,9 @@ A preset dictionary is history both sides already have, so it need not be sent.
 
 ```goose
 var w = igzip::zlib_writer(1);
-guard w.set_dict(dictionary).ok() else { abort("dictionary failed"); };
-guard w.write(payload, out).ok() else { abort("write failed"); };
-guard w.finish(out).ok() else { abort("finish failed"); };
+if !w.set_dict(dictionary) { abort("dictionary failed"); };
+if !w.write(payload, out) { abort("write failed"); };
+if !w.finish(out) { abort("finish failed"); };
 ```
 
 A zlib stream with a dictionary advertises FDICT and DICTID automatically.
@@ -238,7 +238,7 @@ var out: u8[>..] = [];
 
 let used, err = r.read(member, out);
 guard err == igzip::Status.NeedDict else { /* no dictionary needed */ };
-guard r.set_dict(dictionary).ok() else { abort("set_dict failed"); };
+if !r.set_dict(dictionary) { abort("set_dict failed"); };
 let u2, e2 = r.read(member[used..], out);      // continues from where it stopped
 ```
 
@@ -254,7 +254,7 @@ Two facts worth knowing:
 - igzip **never compares** the dictionary against the stream's DICTID. With a
   gzip or zlib trailer a wrong dictionary is caught at the end (`BadChecksum`);
   on a **raw** stream there is no trailer and nothing catches it — you get wrong
-  bytes with `Status.Ok`. Use a wrapper when the bytes must be trusted.
+  bytes and no error. Use a wrapper when the bytes must be trusted.
 
 ## Trained tables
 
@@ -270,7 +270,7 @@ t.add(json_body);                              // sample bodies as they go by
 guard t.symbols() >= 64 * 1024 else { /* keep warming */ };
 
 let tables, built = t.build();
-guard built.ok() else { abort(igzip::status_name(built)); };
+if !built { abort(str("training failed: ", igzip::error())); };
 c.set_tables(tables);                          // level 0 from here on
 ```
 
@@ -326,17 +326,38 @@ trained table. Same bytes out, 3.8x and 1.6x less time in.
 | `Corrupt` | the bytes are not a valid deflate stream |
 | `BadChecksum` | the trailer does not match the decoded bytes |
 
-A `Status` is not a condition in Goose — it takes a `bool` or an optional — so the
-common case is `guard err.ok() else { ... }`, and a specific failure is
-`err == igzip::Status.BadTable`.
-
-It also prints itself, so a diagnostic needs no second call:
+Every call that can fail returns a `bool`, with any data in front of it:
 
 ```goose
-let err = w.finish(out);
-guard err.ok() else { abort(str("finish failed: ", err)); };
+let used, ok = r.read(gz, body);
+if !ok { abort(str("read failed: ", igzip::error())); };
 ```
 
+The reason is out of band, in the two accessors `goose_gfx` uses:
+`igzip::error()` is that reason as text, and `igzip::status()` is the `Status`
+itself, for a caller that needs to branch. Both describe the call just made —
+success included, which clears them — and both are per thread, so a worker's
+failure is its own:
+
+```goose
+let err = igzip::status();
+if err {
+    match err {
+        Truncated => { /* feed more, or re-fetch */ },
+        Corrupt => { /* drop it */ },
+        NeedDict => { /* set_dict, then keep reading */ },
+        _ => { /* anything else */ },
+    }
+}
+```
+
+`Status` names twelve failures plus `Other`, and prints itself, so
+`str("finish failed: ", igzip::error())` needs no second call. `status_name`
+gives the same words when you already hold a `Status`.
+
+`guard` is still the right tool when the condition is not a status — `guard
+r.finished() else { ... }` — and a status-only call reads naturally negated:
+`if !w.finish(out) { ... }`.
 
 One thing to expect: a corrupted payload often comes back as `Ok` with the member
 unfinished rather than as an error, because igzip reports completion in a block

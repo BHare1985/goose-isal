@@ -239,6 +239,24 @@ static void bld_claim(gs_rref b, int64_t n) {
 
 /* ---- diagnostics --------------------------------------------------------- */
 
+/* The last failure this thread saw, for `igzip::error()` and `igzip::status()`.
+ *
+ * This is the one piece of mutable state in the file, and it is per thread
+ * (`_Thread_local`) so two workers sharing nothing still report their own
+ * failures. Every call writes it, zero included, so it describes the call just
+ * made rather than a history: `igzip::status()` is null exactly when the bool
+ * the call returned was true. It is never read by this code; a caller asks for
+ * it after a `false`, the way goose_gfx's `gfx::error()` is used.
+ *
+ * Nothing else in this file has storage duration, which is what keeps two
+ * compressors in two threads independent; a per-thread store does not weaken
+ * that. */
+static _Thread_local int32_t gs_last_status = 0;
+
+void igzip_gs_record(int32_t rc) { gs_last_status = rc; }
+int32_t igzip_gs_last_status(void) { return gs_last_status; }
+
+
 int32_t igzip_gs_version_major(void) { return ISAL_MAJOR_VERSION; }
 int32_t igzip_gs_version_minor(void) { return ISAL_MINOR_VERSION; }
 int32_t igzip_gs_version_patch(void) { return ISAL_PATCH_VERSION; }

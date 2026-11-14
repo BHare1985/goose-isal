@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.4.0 — unreleased
+
+### Changed (breaking)
+
+- **A call that can fail returns a `bool`, with its data in front of it** —
+  `let used, ok = r.read(..)`, `let gz, ok = c.compressed(..)` — and the reason is
+  out of band, in the two accessors `goose_gfx` uses: `igzip::error()` for text,
+  `igzip::status()` for the `Status`. `Status` lost its `Ok` variant (it is *why
+  a call failed*) and `ok()` is gone.
+
+  ```goose
+  if !w.finish(out) { abort(str("finish failed: ", igzip::error())); };
+
+  let err = igzip::status();
+  if err { match err { Truncated => ..., Corrupt => ..., _ => ... } }
+  ```
+
+  Migrating: `guard x.ok()` becomes `if !x { ... }`, `assert(e == Status.Ok)`
+  becomes `assert(e)`, and a specific failure is `assert(!e)` followed by
+  `igzip::status()`. Every call records its outcome and success clears the
+  record, so `status()` is null exactly when the bool was true. The record is
+  per thread, so a worker's failure is its own.
+- `Status` implements `format`, so `print(err)` needs no `status_name` call.
+
+### Internals
+
+- The per-thread status (`_Thread_local` in `src/igzip_shim.c`) is the one piece
+  of mutable state in the package, and the one exception to the shim's
+  no-statics rule. It is per thread, written by every fallible call and read only
+  by `status()` / `error()`.
+- Every ISA-L number the two status tables are keyed on is `_Static_assert`ed.
+- Four defensive count checks in the shim: the memcpy length and the builder's
+  stack top come from a checked number rather than one written by code the shim
+  does not own.
+
 ## 0.3.0 — 2026-11-14
 
 The other half of the codec: the package now reads what it writes, and its own

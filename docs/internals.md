@@ -144,7 +144,7 @@ Each of these was measured, not assumed.
     (2114 / 2257), and `dict_length` is written by the setter and both resets and
     read by nothing. The dictionary works purely as `tmp_out_buffer` history, so
     a wrong one is caught only by a gzip/zlib trailer. On `Wrapper.Raw` there is
-    no trailer and nothing catches it: wrong bytes, `Status.Ok`. That is
+    no trailer and nothing catches it: wrong bytes and no error. That is
     documented on `set_dict` and pinned by a test.
 16. **A gzip or zlib header is parsed in Goose, not by ISA-L.** `read_gzip_header`
     and `read_zlib_header` walk the container themselves over a `const u8[:]` and
@@ -375,11 +375,11 @@ server runs; `make check` covers the package and `make test` the tests.
   `ReaderState` directly; casting an `i32` to an enum is not allowed.
 - `resize` on a builder needs a fill value (`dst.resize(n, 0)`); there is no
   zero-initializing overload for `u8[>..]`.
-- A multiple return has to be taken whole: `let used, err = r.read(..)`. Binding
-  only the first value and then calling `err.ok()` reports
-  `unknown function or member: ok`, because `err` was inferred as `i64`.
-- A status and a count from the same call cannot be compared with each other:
-  compare the status against `Status.Ok` and the count separately.
+- A multiple return has to be taken whole: `let used, ok = r.read(..)`. Binding
+  only the first value leaves the second name referring to the count, and the
+  mistake surfaces later as a nonsense comparison rather than at the binding.
+- A status is out of band: `if !call { ... igzip::error() ... }`, and
+  `igzip::status()` narrowed by `if` before a `match`.
 
 ## Conventions
 
@@ -389,8 +389,18 @@ server runs; `make check` covers the package and `make test` the tests.
 - Prose that explains *how to use* the package belongs in `docs/guide.md`; the
   README is a front page and the API tables. A behaviour that a maintainer must
   not undo belongs here.
-- `Status` is the only failure channel. Every C call goes through `status_of`;
-  igzip's negative codes never escape.
+- `Status` is the only failure channel. Every C call goes through `record`,
+  which stores its code for `status()`/`error()` and returns the call's bool;
+  igzip's negative codes never escape. `status_of` and `status_code` are the
+  inverse pair that names a code and finds it again, and both are
+  compiler-exhaustive over the enum.
+- **One piece of mutable state, per thread.** `src/igzip_shim.c` keeps
+  `_Thread_local int32_t gs_last_status`, written by every fallible call
+  (zero on success, so `status()` is null exactly when the bool was true) and
+  read only by `status()` / `error()`. It is the one exception to "no mutable
+  statics", it is per thread so two workers stay independent, and it means the
+  reason belongs to the *call*, not to the value: a caller that wants a
+  `Reader`'s failure to travel with it must ask immediately.
 - Validate in Goose when the check is about the API contract (level range, input
   size); validate in C when it is about pointers or sizes.
 - Tests assert; they do not print and hope. `test/contract.goose` keeps the

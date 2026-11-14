@@ -83,10 +83,10 @@ thread_fn worker() {
         let err = c.compress(body, out);
 
         var code: i32 = 0;
-        if !err.ok() { code = 1; }
+        if !err { code = 1; }
         qput(Result {
             records: job.records,
-            size:    if err == igzip::Status.Ok { out.len as i32 } else { -1 },
+            size:    if err == true { out.len as i32 } else { -1 },
             code:    code,
         });
     }
@@ -110,11 +110,11 @@ thread_fn stream_worker() {
         out.clear();
         let err = holder[0].write(body, out);
         var code: i32 = 0;
-        if err.ok() {
+        if err {
             let done = holder[0].finish(out);
-            if done.ok() {
+            if done {
                 let again = holder[0].reset();
-                if !again.ok() { code = 3; }
+                if !again { code = 3; }
             } else {
                 code = 2;
             }
@@ -147,15 +147,15 @@ thread_fn reader_worker() {
         out.clear();
         let used, err = holder[0].read(box.data[..box.len], out);
         var code: i32 = 0;
-        if used != box.len || !err.ok() {
+        if used != box.len || !err {
             code = 1;
         } else if !holder[0].finished() {
             code = 2;
         } else if !same_bytes(out, body) {
             code = 3;
-        } else if !holder[0].finish().ok() {
+        } else if !holder[0].finish() {
             code = 4;
-        } else if !holder[0].reset().ok() {
+        } else if !holder[0].reset() {
             code = 5;
         }
         qput(RoundResult {
@@ -174,6 +174,15 @@ fn same_bytes(a: const u8[:], b: const u8[:]) -> bool {
         if x != b[i] { return false; }
     }
     return true;
+}
+
+// The reason the last failing call gave, compared with a variant. Five lines
+// rather than a whole assertion shape at 40 call sites: with a bool return the
+// detail is out of band, in igzip::status().
+fn failed_as(want: igzip::Status) -> bool {
+    let s = igzip::status();
+    guard s else { return false; }
+    return s == want;
 }
 
 fn main() {
@@ -196,9 +205,9 @@ fn main() {
         body.clear();
         make_body(body, records as i32);
         member.clear();
-        assert(w.write(body, member) == igzip::Status.Ok);
-        assert(w.finish(member) == igzip::Status.Ok);
-        assert(w.reset() == igzip::Status.Ok);
+        assert(w.write(body, member));
+        assert(w.finish(member));
+        assert(w.reset());
         assert(member.len <= BOX);
         var box = RoundBox { records: records as i32, len: member.len as i32, .. };
         box.data[..member.len].move_from(member[..]);

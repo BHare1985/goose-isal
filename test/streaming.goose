@@ -16,15 +16,15 @@ let TMP = "build/tmp/stream";
 fn one_shot(body: const u8[:], wrap: igzip::Wrapper, level: i32) -> u8[>..] {
     var c = igzip::compressor(wrap, level);
     let out, err = c.compressed(body);
-    assert(err == igzip::Status.Ok);
+    assert(err);
     return out;
 }
 
 fn streamed(body: const u8[:], wrap: igzip::Wrapper, level: i32) -> u8[>..] {
     var w = igzip::writer(wrap, level);
     var out: u8[>..] = [];
-    assert(w.write(body, out) == igzip::Status.Ok);
-    assert(w.finish(out) == igzip::Status.Ok);
+    assert(w.write(body, out));
+    assert(w.finish(out));
     return out;
 }
 
@@ -36,11 +36,11 @@ fn streamed_chunks(body: const u8[:], chunks: const i64[:]) -> u8[>..] {
     while pos < body.len {
         var n = chunks[ci % chunks.len];
         if n > body.len - pos { n = body.len - pos; }
-        assert(w.write(body[pos..pos + n], out) == igzip::Status.Ok);
+        assert(w.write(body[pos..pos + n], out));
         pos += n;
         ci++;
     }
-    assert(w.finish(out) == igzip::Status.Ok);
+    assert(w.finish(out));
     return out;
 }
 
@@ -107,11 +107,11 @@ fn test_flush() {
 
     var w = igzip::gzip_writer(1);
     var out: u8[>..] = [];
-    assert(w.write(a, out) == igzip::Status.Ok);
-    assert(w.flush(out) == igzip::Status.Ok);
+    assert(w.write(a, out));
+    assert(w.flush(out));
     assert(write_file(str(TMP, "/sync_prefix.gz"), out));
-    assert(w.write(b, out) == igzip::Status.Ok);
-    assert(w.finish(out) == igzip::Status.Ok);
+    assert(w.write(b, out));
+    assert(w.finish(out));
     assert(write_file(str(TMP, "/sync_full.gz"), out));
     assert(write_file(str(TMP, "/flush_a.bin"), a));
     assert(write_file(str(TMP, "/flush_b.bin"), b));
@@ -122,10 +122,10 @@ fn test_flush() {
     support::noise(noise, 200000);
     var wn = igzip::gzip_writer(1);
     var nout: u8[>..] = [];
-    assert(wn.write(noise, nout) == igzip::Status.Ok);
-    assert(wn.flush(nout) == igzip::Status.Ok);
-    assert(wn.write(noise, nout) == igzip::Status.Ok);
-    assert(wn.finish(nout) == igzip::Status.Ok);
+    assert(wn.write(noise, nout));
+    assert(wn.flush(nout));
+    assert(wn.write(noise, nout));
+    assert(wn.finish(nout));
     assert(write_file(str(TMP, "/sync_big.gz"), nout));
     assert(write_file(str(TMP, "/sync_big.bin"), noise));
 
@@ -133,30 +133,30 @@ fn test_flush() {
     // decode as B with a fresh decoder, which would fail if they referenced A.
     var wf = igzip::raw_writer(1);
     var ro: u8[>..] = [];
-    assert(wf.write(a, ro) == igzip::Status.Ok);
-    assert(wf.flush(igzip::Flush.Full, ro) == igzip::Status.Ok);
+    assert(wf.write(a, ro));
+    assert(wf.flush(igzip::Flush.Full, ro));
     let mark = ro.len;
-    assert(wf.write(b, ro) == igzip::Status.Ok);
-    assert(wf.finish(ro) == igzip::Status.Ok);
+    assert(wf.write(b, ro));
+    assert(wf.finish(ro));
     assert(write_file(str(TMP, "/full_tail.deflate"), ro[mark..]));
 
     // Full flush is also a decode point in a complete gzip stream.
     var wg = igzip::gzip_writer(1);
     var gz: u8[>..] = [];
-    assert(wg.write(a, gz) == igzip::Status.Ok);
-    assert(wg.flush(igzip::Flush.Full, gz) == igzip::Status.Ok);
-    assert(wg.write(b, gz) == igzip::Status.Ok);
-    assert(wg.finish(gz) == igzip::Status.Ok);
+    assert(wg.write(a, gz));
+    assert(wg.flush(igzip::Flush.Full, gz));
+    assert(wg.write(b, gz));
+    assert(wg.finish(gz));
     assert(write_file(str(TMP, "/full_full.gz"), gz));
 
     // Two flushes in a row are legal; ISA-L emits a redundant sync marker and
     // the stream still decodes.
     var wt = igzip::gzip_writer(1);
     var to: u8[>..] = [];
-    assert(wt.write(a, to) == igzip::Status.Ok);
-    assert(wt.flush(to) == igzip::Status.Ok);
-    assert(wt.flush(to) == igzip::Status.Ok);
-    assert(wt.finish(to) == igzip::Status.Ok);
+    assert(wt.write(a, to));
+    assert(wt.flush(to));
+    assert(wt.flush(to));
+    assert(wt.finish(to));
     assert(write_file(str(TMP, "/sync_twice.gz"), to));
 
     // What the flush claims, asserted in Goose rather than in a Python script:
@@ -165,22 +165,22 @@ fn test_flush() {
     // otherwise have referenced.
     var tail_reader = igzip::raw_reader();
     let tail, tail_err = tail_reader.inflated(ro[mark..]);
-    assert(tail_err == igzip::Status.Ok);
+    assert(tail_err);
     assert(support::same(tail, b));
 
     // A redundant flush marker does not confuse the decoder either.
     var twice = igzip::gzip_reader();
     var two: u8[>..] = [];
     let t_used, t_err = twice.read(to, two);
-    assert(t_err == igzip::Status.Ok);
+    assert(t_err);
     assert(t_used == to.len);
-    assert(twice.finish() == igzip::Status.Ok);
+    assert(twice.finish());
     assert(support::same(two, a));
 
     // The flush larger than the 64 KiB chunk decodes to the body twice over.
     var big_reader = igzip::gzip_reader();
     let big_plain, big_err = big_reader.inflated(nout);
-    assert(big_err == igzip::Status.Ok);
+    assert(big_err);
     assert(big_plain.len == noise.len * 2);
     assert(support::same(big_plain[..noise.len], noise));
     assert(support::same(big_plain[noise.len..], noise));
@@ -188,7 +188,7 @@ fn test_flush() {
     // And the Full-flushed gzip member decodes as one stream, A then B.
     var full_reader = igzip::gzip_reader();
     let full_plain, full_err = full_reader.inflated(gz);
-    assert(full_err == igzip::Status.Ok);
+    assert(full_err);
     assert(full_plain.len == a.len + b.len);
     assert(support::same(full_plain[..a.len], a));
     assert(support::same(full_plain[a.len..], b));
@@ -200,27 +200,29 @@ fn test_windows() {
 
     var w = igzip::gzip_writer(1);
     var out: u8[>..] = [];
-    assert(w.write_windowed(body, out, 65536) == igzip::Status.Ok);
-    assert(w.finish(out) == igzip::Status.Ok);
+    assert(w.write_windowed(body, out, 65536));
+    assert(w.finish(out));
     let direct = streamed(body, igzip::Wrapper.Gzip, 1);
     assert(out.len == direct.len && support::same(out, direct));
 
     var w2 = igzip::gzip_writer(1);
     var o2: u8[>..] = [];
-    assert(w2.write_windowed(body, o2, 1) == igzip::Status.Ok);
-    assert(w2.finish(o2) == igzip::Status.Ok);
+    assert(w2.write_windowed(body, o2, 1));
+    assert(w2.finish(o2));
     assert(support::same(o2, direct));
 
     var wlarge = igzip::gzip_writer(1);
     var olarge: u8[>..] = [];
-    assert(wlarge.write_windowed(body, olarge, igzip::MAX_INPUT) == igzip::Status.Ok);
-    assert(wlarge.finish(olarge) == igzip::Status.Ok);
+    assert(wlarge.write_windowed(body, olarge, igzip::MAX_INPUT));
+    assert(wlarge.finish(olarge));
     assert(support::same(olarge, direct));
 
     var w3 = igzip::gzip_writer(1);
     var o3: u8[>..] = [];
-    assert(w3.write_windowed(body, o3, 0) == igzip::Status.Overflow);
-    assert(w3.write_windowed(body, o3, igzip::MAX_INPUT + 1) == igzip::Status.Overflow);
+    assert(!w3.write_windowed(body, o3, 0));
+    assert(failed_as(igzip::Status.Overflow));
+    assert(!w3.write_windowed(body, o3, igzip::MAX_INPUT + 1));
+    assert(failed_as(igzip::Status.Overflow));
 }
 
 // Output larger than the 64 KiB chunk, and a body large enough that the
@@ -249,6 +251,15 @@ fn write_artifacts(body: const u8[:]) {
     // checks it rather than asserting byte identity.
     let slow = streamed(body, igzip::Wrapper.Gzip, 0);
     assert(write_file(str(TMP, "/level0.gz"), slow));
+}
+
+// The reason the last failing call gave, compared with a variant. Five lines
+// rather than a whole assertion shape at 40 call sites: with a bool return the
+// detail is out of band, in igzip::status().
+fn failed_as(want: igzip::Status) -> bool {
+    let s = igzip::status();
+    guard s else { return false; }
+    return s == want;
 }
 
 fn main() {

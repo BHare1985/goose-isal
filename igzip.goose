@@ -85,8 +85,11 @@ let MAX_HEADER = 1 << 20;
 let CHUNK_SIZE = 65536;
 
 // How a call ended. `Ok` is the only success.
+// Why a call failed. There is no success value: every call that can fail returns
+// a `bool`, and the reason is available from `status()` / `error()` — the shape
+// goose_gfx uses, where `gfx::open(..)` returns a bool and `gfx::error()` says
+// why. One value per distinct failure.
 enum Status {
-    Ok,
     Overflow,     // input too large for igzip's 32-bit lengths
     BadLevel,     // level outside 0..3
     BadLevelBuf,  // igzip's level buffer unusable
@@ -100,6 +103,74 @@ enum Status {
     Corrupt,      // the bytes are not a valid deflate stream
     BadChecksum,  // the trailer does not match the decoded bytes
     Other,        // an igzip error this package does not name
+}
+
+// A stable address for each variant, so `status()` can hand one back as a
+// reference without allocating per call.
+const E_OVERFLOW:      Status = Status.Overflow;
+const E_BAD_LEVEL:     Status = Status.BadLevel;
+const E_BAD_LEVEL_BUF: Status = Status.BadLevelBuf;
+const E_BAD_STATE:     Status = Status.BadState;
+const E_BAD_WRAPPER:   Status = Status.BadWrapper;
+const E_BAD_TABLE:     Status = Status.BadTable;
+const E_BAD_HEADER:    Status = Status.BadHeader;
+const E_TRUNCATED:     Status = Status.Truncated;
+const E_TOO_SMALL:     Status = Status.TooSmall;
+const E_NEED_DICT:     Status = Status.NeedDict;
+const E_CORRUPT:       Status = Status.Corrupt;
+const E_BAD_CHECKSUM:  Status = Status.BadChecksum;
+const E_OTHER:         Status = Status.Other;
+
+fn failure(s: Status) -> const Status? {
+    return match s {
+        Overflow => E_OVERFLOW,
+        BadLevel => E_BAD_LEVEL,
+        BadLevelBuf => E_BAD_LEVEL_BUF,
+        BadState => E_BAD_STATE,
+        BadWrapper => E_BAD_WRAPPER,
+        BadTable => E_BAD_TABLE,
+        BadHeader => E_BAD_HEADER,
+        Truncated => E_TRUNCATED,
+        TooSmall => E_TOO_SMALL,
+        NeedDict => E_NEED_DICT,
+        Corrupt => E_CORRUPT,
+        BadChecksum => E_BAD_CHECKSUM,
+        Other => E_OTHER,
+    };
+}
+
+// The C return code a variant stands for: the inverse of status_of, so a
+// failure the Goose side decides on can be recorded the same way a C one is.
+fn status_code(s: Status) -> i32 {
+    return match s {
+        Overflow => -1,
+        BadState => -3,
+        BadLevel => -4,
+        BadLevelBuf => -5,
+        BadWrapper => -7,
+        BadHeader => -8,
+        BadTable => -10,
+        Truncated => -11,
+        NeedDict => -12,
+        TooSmall => -13,
+        Corrupt => -14,
+        BadChecksum => -15,
+        Other => -16,
+    };
+}
+
+// Records a C return code and reports whether the call succeeded, so a call
+// site reads `if !write_window(..) { return false; }`.
+fn record(rc: i32) -> bool {
+    igzip_gs_record(rc); // 0 on success, which clears the record
+    return rc == 0;
+}
+
+// The same for a failure this package decided on itself (a bad level, a call in
+// the wrong state), so `error()` describes it too.
+fn record_status(s: Status) -> bool {
+    igzip_gs_record(status_code(s));
+    return false;
 }
 
 // A complete Huffman table: 2,232 bytes, the size of `struct isal_hufftables`,
@@ -276,6 +347,8 @@ struct Reader {
 // C surface (src/igzip_shim.c)
 // ---------------------------------------------------------------------------
 
+extern fn igzip_gs_record(rc: i32);
+extern fn igzip_gs_last_status() -> i32;
 extern fn igzip_gs_version_major() -> i32;
 extern fn igzip_gs_version_minor() -> i32;
 extern fn igzip_gs_version_patch() -> i32;
@@ -329,7 +402,7 @@ fn wrapper_code(w: Wrapper) -> i32 {
 // number alone cannot be right for both.
 fn status_of(rc: i32) -> Status {
     return match rc {
-        0 => Status.Ok,
+        0 => Status.Other,
         -1 => Status.Overflow,
         -3 => Status.BadState,
         -4 => Status.BadLevel,
@@ -345,6 +418,28 @@ fn status_of(rc: i32) -> Status {
         -15 => Status.BadChecksum,
         _ => Status.Other,
     };
+}
+
+// Why the last call failed, or null if it succeeded. Every call that can fail
+// records its outcome here, success included, so `status()` and the `bool` the
+// call returned always agree: `!ok` means `status()` is non-null.
+//
+// It is per thread, so a worker's failure is its own, and it is the most recent
+// call's outcome rather than a history -- ask straight away, the way
+// `gfx::error()` is used.
+fn status() -> const Status? {
+    let rc = igzip_gs_last_status();
+    if rc == 0 { return null; }
+    return failure(status_of(rc));
+}
+
+// That reason as text, or "" when nothing has failed on this thread:
+//
+//   if !w.finish(out) { abort(str("finish failed: ", igzip::error())); };
+fn error() -> const u8[:] {
+    let s = status();
+    if s { return status_name(s); }
+    return "";
 }
 
 // ---------------------------------------------------------------------------
@@ -373,24 +468,24 @@ fn raw_compressor(level: i32 = 1) -> Compressor {
 // Compresses `src` into `out`, appending. One member per call, so two calls
 // leave two members back to back. Nothing is retained between calls, so one
 // compressor serves every body.
-fn compress(c: Compressor&, src: const u8[:], out: u8[>..]&) -> Status {
+fn compress(c: Compressor&, src: const u8[:], out: u8[>..]&) -> bool {
     // Checked here: igzip takes the level as an unsigned 32-bit field, so a
     // negative value would arrive as 0xFFFFFFFF.
-    guard c.level >= 0 && c.level <= 3 else { return Status.BadLevel; }
-    guard src.len <= MAX_INPUT else { return Status.Overflow; }
+    guard c.level >= 0 && c.level <= 3 else { return record_status(Status.BadLevel); }
+    guard src.len <= MAX_INPUT else { return record_status(Status.Overflow); }
     let wrap = wrapper_code(c.wrap);
     if c.trained {
         // A table is raw C memory that igzip indexes with its own header length,
         // so a fabricated or deserialized one is checked before it is used.
-        guard igzip_gs_tables_check(c.tables) == 0 else { return Status.BadTable; }
-        return status_of(igzip_gs_compress_trained(c, c.tables, src, out, wrap));
+        guard igzip_gs_tables_check(c.tables) == 0 else { return record_status(Status.BadTable); }
+        return record(igzip_gs_compress_trained(c, c.tables, src, out, wrap));
     }
-    return status_of(igzip_gs_compress(c, src, out, c.level, wrap));
+    return record(igzip_gs_compress(c, src, out, c.level, wrap));
 }
 
 // Compresses into a new buffer, built in the caller's destination: for a
 // caller that has nowhere to put the bytes yet.
-fn compressed(c: Compressor&, src: const u8[:]) -> u8[>..], Status {
+fn compressed(c: Compressor&, src: const u8[:]) -> u8[>..], bool {
     var out: u8[>..] = [];
     let err = compress(c, src, out);
     return out, err;
@@ -451,22 +546,22 @@ fn writer_size() -> i64 {
 // Compresses `src` in windows of at most `step` bytes. `write` uses this with
 // MAX_IN_STEP; tests use a smaller step to exercise the same code path without
 // allocating a 2 GiB input.
-fn write_windowed(w: Writer&, src: const u8[:], out: u8[>..]&, step: i64) -> Status {
-    guard step > 0 && step <= MAX_INPUT else { return Status.Overflow; }
+fn write_windowed(w: Writer&, src: const u8[:], out: u8[>..]&, step: i64) -> bool {
+    guard step > 0 && step <= MAX_INPUT else { return record_status(Status.Overflow); }
     var pos: i64 = 0;
     while pos < src.len {
         var n = src.len - pos;
         if n > step { n = step; }
         let err = write_window(w, src[pos..pos + n], out);
-        if err != Status.Ok { return err; }
+        if !err { return err; }
         pos += n;
     }
-    return Status.Ok;
+    return true;
 }
 
 // Appends the compressed bytes for `src` to `out`. All of `src` is consumed
 // before returning; the writer stages igzip's output through its 64 KiB chunk.
-fn write(w: Writer&, src: const u8[:], out: u8[>..]&) -> Status {
+fn write(w: Writer&, src: const u8[:], out: u8[>..]&) -> bool {
     return write_windowed(w, src, out, MAX_IN_STEP);
 }
 
@@ -479,28 +574,28 @@ fn append_output(out: u8[>..]&, chunk: const u8[:], n: u32) {
 // One window: feed igzip until it has taken every byte of `src` and drained
 // its output. A zero-progress result would loop forever, so it is a Status
 // rather than a hang.
-fn write_window(w: Writer&, src: const u8[:], out: u8[>..]&) -> Status {
+fn write_window(w: Writer&, src: const u8[:], out: u8[>..]&) -> bool {
     var consumed: i64 = 0;
     loop {
         var used:    u32 = 0;
         var written: u32 = 0;
         var more = false;
         let rc = igzip_gs_writer_step(w, src[consumed..], 0, w.chunk, used, written, more);
-        if rc != 0 { return status_of(rc); }
+        if rc != 0 { return record(rc); }
         append_output(out, w.chunk, written);
         consumed += used;
-        if !more { return Status.Ok; }
-        if used == 0 && written == 0 { return Status.Other; }
+        if !more { return true; }
+        if used == 0 && written == 0 { return record_status(Status.Other); }
     }
 }
 
 // A Sync flush: everything written so far is a complete decode point. The
 // two-argument form is the common one; the three-argument form selects Full.
-fn flush(w: Writer&, out: u8[>..]&) -> Status {
+fn flush(w: Writer&, out: u8[>..]&) -> bool {
     return flush(w, Flush.Sync, out);
 }
 
-fn flush(w: Writer&, mode: Flush, out: u8[>..]&) -> Status {
+fn flush(w: Writer&, mode: Flush, out: u8[>..]&) -> bool {
     let code: u8 = match mode {
         Sync => 1,
         Full => 2,
@@ -510,28 +605,28 @@ fn flush(w: Writer&, mode: Flush, out: u8[>..]&) -> Status {
 
 // Writes the final block and trailer. The writer cannot be used again until
 // `reset`.
-fn finish(w: Writer&, out: u8[>..]&) -> Status {
+fn finish(w: Writer&, out: u8[>..]&) -> bool {
     return step_empty(w, 3, out);
 }
 
-fn step_empty(w: Writer&, mode: u8, out: u8[>..]&) -> Status {
+fn step_empty(w: Writer&, mode: u8, out: u8[>..]&) -> bool {
     loop {
         var used:    u32 = 0;
         var written: u32 = 0;
         var more = false;
         let rc = igzip_gs_writer_step(w, "", mode, w.chunk, used, written, more);
-        if rc != 0 { return status_of(rc); }
+        if rc != 0 { return record(rc); }
         append_output(out, w.chunk, written);
-        if !more { return Status.Ok; }
-        if used == 0 && written == 0 { return Status.Other; }
+        if !more { return true; }
+        if used == 0 && written == 0 { return record_status(Status.Other); }
     }
 }
 
 // Returns the writer to Fresh, preserving its wrapper, base level and trained
 // table, and dropping the dictionary and any header. This is how a server
 // reuses one writer for the next response, and how a mid-stream copy recovers.
-fn reset(w: Writer&) -> Status {
-    return status_of(igzip_gs_writer_reset(w));
+fn reset(w: Writer&) -> bool {
+    return record(igzip_gs_writer_reset(w));
 }
 
 // Writes a custom gzip header. RFC 1952 requires name and comment to be
@@ -539,12 +634,12 @@ fn reset(w: Writer&) -> Status {
 // here and passed to C. The header goes through the 64 KiB chunk unless it is
 // larger than that, in which case it is built in a temporary of the required
 // size and appended.
-fn write_gzip_header(w: Writer&, hdr: GzipHeader, out: u8[>..]&) -> Status {
+fn write_gzip_header(w: Writer&, hdr: GzipHeader, out: u8[>..]&) -> bool {
     // Bound the NUL-terminated copies before making them; the shim also caps
     // the measured header, but this refuses an untrusted multi-gigabyte name
     // before the first copy.
     guard hdr.name.len <= MAX_HEADER && hdr.comment.len <= MAX_HEADER else {
-        return Status.BadHeader;
+        return record_status(Status.BadHeader);
     }
 
     var name_buf: u8[>..] = [];
@@ -562,10 +657,10 @@ fn write_gzip_header(w: Writer&, hdr: GzipHeader, out: u8[>..]&) -> Status {
     var needed:  u32 = 0;
     let rc = igzip_gs_writer_gzip_header(w, hdr.text, hdr.mtime, hdr.xflags, hdr.os, hdr.hcrc,
                                         name_buf, comment_buf, hdr.extra, w.chunk, written, needed);
-    if rc != 0 { return status_of(rc); }
+    if rc != 0 { return record(rc); }
 
     if needed > 0 {
-        guard needed <= MAX_HEADER else { return Status.BadHeader };
+        guard needed <= MAX_HEADER else { return record_status(Status.BadHeader); }
         // Larger than the 64 KiB chunk. Build the header in a temporary of
         // exactly the required size; `out` may be one of the arrays `hdr`'s
         // slices point into, and growing it while those views are live is not
@@ -577,26 +672,26 @@ fn write_gzip_header(w: Writer&, hdr: GzipHeader, out: u8[>..]&) -> Status {
         let rc2 = igzip_gs_writer_gzip_header(w, hdr.text, hdr.mtime, hdr.xflags, hdr.os, hdr.hcrc,
                                              name_buf, comment_buf, hdr.extra, big,
                                              written2, needed2);
-        if rc2 != 0 { return status_of(rc2); }
-        if needed2 > 0 { return Status.BadHeader; }
+        if rc2 != 0 { return record(rc2); }
+        if needed2 > 0 { return record_status(Status.BadHeader); }
         append_output(out, big, written2);
-        return Status.Ok;
+        return true;
     }
 
     append_output(out, w.chunk, written);
-    return Status.Ok;
+    return true;
 }
 
 // Writes a custom zlib header. If a dictionary was set, FDICT and DICTID are
 // filled in automatically, because a zlib decoder rejects a dictionary stream
 // whose header does not advertise one.
-fn write_zlib_header(w: Writer&, hdr: ZlibHeader, out: u8[>..]&) -> Status {
+fn write_zlib_header(w: Writer&, hdr: ZlibHeader, out: u8[>..]&) -> bool {
     var written: u32 = 0;
     let rc = igzip_gs_writer_zlib_header(w, hdr.window_bits, hdr.flevel, hdr.dict_flag,
                                         hdr.dict_id, w.chunk, written);
-    if rc != 0 { return status_of(rc); }
+    if rc != 0 { return record(rc); }
     append_output(out, w.chunk, written);
-    return Status.Ok;
+    return true;
 }
 
 // The other direction: reading back the same two headers, for a caller that
@@ -615,16 +710,16 @@ fn write_zlib_header(w: Writer&, hdr: ZlibHeader, out: u8[>..]&) -> Status {
 // This parses and reports; it does not verify the optional FHCRC, because the
 // decoder does not either (`isal_inflate` steps over it), and a header that one
 // call accepts and another rejects is worse than a documented gap.
-fn read_gzip_header(src: const u8[:]) -> GzipInfo, Status {
+fn read_gzip_header(src: const u8[:]) -> GzipInfo, bool {
     var info = GzipInfo { .. };
     // 10 fixed bytes: ID1, ID2, CM, FLG, MTIME, XFL, OS.
-    guard src.len >= 10 else { return info, Status.Truncated; }
-    guard (src[0] as i64) == 0x1f && (src[1] as i64) == 0x8b else { return info, Status.BadWrapper; }
-    guard (src[2] as i64) == 8 else { return info, Status.BadWrapper; }
+    guard src.len >= 10 else { return info, record_status(Status.Truncated); }
+    guard (src[0] as i64) == 0x1f && (src[1] as i64) == 0x8b else { return info, record_status(Status.BadWrapper); }
+    guard (src[2] as i64) == 8 else { return info, record_status(Status.BadWrapper); }
 
     let flg = src[3] as i64;
     // RFC 1952 reserves the top three bits and requires them to be zero.
-    guard (flg & 0xe0) == 0 else { return info, Status.BadHeader; }
+    guard (flg & 0xe0) == 0 else { return info, record_status(Status.BadHeader); }
     info.text = (flg & 0x01) != 0;
     info.hcrc = (flg & 0x02) != 0;
     info.mtime = src[4] | ((src[5] as u32) << 8) | ((src[6] as u32) << 16) |
@@ -635,34 +730,34 @@ fn read_gzip_header(src: const u8[:]) -> GzipInfo, Status {
     var pos: i64 = 10;
     if (flg & 0x04) != 0 {
         // FEXTRA: a 16-bit length, then that many bytes.
-        guard src.len >= pos + 2 else { return info, Status.Truncated; }
+        guard src.len >= pos + 2 else { return info, record_status(Status.Truncated); }
         let xlen = src[pos] | ((src[pos + 1] as i64) << 8);
         pos += 2;
-        guard src.len >= pos + xlen else { return info, Status.Truncated; }
+        guard src.len >= pos + xlen else { return info, record_status(Status.Truncated); }
         info.extra_at = pos;
         info.extra_len = xlen;
         pos += xlen;
     }
     if (flg & 0x08) != 0 {
         let end = nul_at(src, pos);
-        guard end >= 0 else { return info, Status.Truncated; }
+        guard end >= 0 else { return info, record_status(Status.Truncated); }
         info.name_at = pos;
         info.name_len = end - pos;
         pos = end + 1;
     }
     if (flg & 0x10) != 0 {
         let end = nul_at(src, pos);
-        guard end >= 0 else { return info, Status.Truncated; }
+        guard end >= 0 else { return info, record_status(Status.Truncated); }
         info.comment_at = pos;
         info.comment_len = end - pos;
         pos = end + 1;
     }
     if info.hcrc {
-        guard src.len >= pos + 2 else { return info, Status.Truncated; }
+        guard src.len >= pos + 2 else { return info, record_status(Status.Truncated); }
         pos += 2;
     }
     info.body_at = pos;
-    return info, Status.Ok;
+    return info, true;
 }
 
 // The index of the first zero byte at or after `at`, or -1 when there is none.
@@ -680,48 +775,48 @@ fn nul_at(src: const u8[:], at: i64) -> i64 {
 // Reads the two-byte header of the zlib member at the start of `src`. The check
 // value zlib requires (CMF*256+FLG divisible by 31) is verified, so a stream
 // with a corrupted header is `BadHeader` here rather than a decode error later.
-fn read_zlib_header(src: const u8[:]) -> ZlibInfo, Status {
+fn read_zlib_header(src: const u8[:]) -> ZlibInfo, bool {
     var info = ZlibInfo { .. };
-    guard src.len >= 2 else { return info, Status.Truncated; }
+    guard src.len >= 2 else { return info, record_status(Status.Truncated); }
     let cmf = src[0] as i64;
     let flg = src[1] as i64;
     // CM (low four bits) must be 8: deflate is the only method zlib defines.
-    guard (cmf & 0x0f) == 8 else { return info, Status.BadWrapper; }
+    guard (cmf & 0x0f) == 8 else { return info, record_status(Status.BadWrapper); }
     // CINFO (high four bits) is log2(window) - 8, so 8..15 once the 8 is added.
-    guard (cmf >> 4) <= 7 else { return info, Status.BadHeader; }
-    guard ((cmf << 8) | flg) % 31 == 0 else { return info, Status.BadHeader; }
+    guard (cmf >> 4) <= 7 else { return info, record_status(Status.BadHeader); }
+    guard ((cmf << 8) | flg) % 31 == 0 else { return info, record_status(Status.BadHeader); }
 
     info.window_bits = (cmf >> 4) + 8;
     info.flevel = (flg >> 6) as u8;
     info.dict = (flg & 0x20) != 0;
     if info.dict {
-        guard src.len >= 6 else { return info, Status.Truncated; }
+        guard src.len >= 6 else { return info, record_status(Status.Truncated); }
         info.dict_id = ((src[2] as u32) << 24) | ((src[3] as u32) << 16) |
                        ((src[4] as u32) << 8) | src[5];
         info.body_at = 6;
     }
-    return info, Status.Ok;
+    return info, true;
 }
 
 // Sets a preset dictionary. Legal only on raw and zlib writers before the
 // first byte. igzip copies the last 32 KiB into its own history buffer, so the
 // slice does not have to outlive the call.
-fn set_dict(w: Writer&, dict: const u8[:]) -> Status {
-    guard dict.len <= MAX_INPUT else { return Status.Overflow; }
-    return status_of(igzip_gs_writer_set_dict(w, dict));
+fn set_dict(w: Writer&, dict: const u8[:]) -> bool {
+    guard dict.len <= MAX_INPUT else { return record_status(Status.Overflow); }
+    return record(igzip_gs_writer_set_dict(w, dict));
 }
 
 // Attaches a trained table to a writer. As with `Compressor`, a supplied table
 // is used at level 0 only, so this pins the level to 0. Legal before the first
 // byte and after a completed Sync or Full flush.
-fn set_tables(w: Writer&, t: const HuffTables&) -> Status {
-    guard igzip_gs_tables_check(t) == 0 else { return Status.BadTable; }
-    return status_of(igzip_gs_writer_set_tables(w, t));
+fn set_tables(w: Writer&, t: const HuffTables&) -> bool {
+    guard igzip_gs_tables_check(t) == 0 else { return record_status(Status.BadTable); }
+    return record(igzip_gs_writer_set_tables(w, t));
 }
 
 // Drops the trained table and returns to the writer's base level.
-fn clear_tables(w: Writer&) -> Status {
-    return status_of(igzip_gs_writer_clear_tables(w));
+fn clear_tables(w: Writer&) -> bool {
+    return record(igzip_gs_writer_clear_tables(w));
 }
 
 // ---------------------------------------------------------------------------
@@ -769,16 +864,16 @@ fn reader_size() -> i64 {
 // destination smaller than the chunk, and the two spellings should not disagree.
 //
 // Input beyond `MAX_INPUT` is split into windows, never rejected.
-fn read(r: Reader&, src: const u8[:], out: u8[>..]&) -> i64, Status {
+fn read(r: Reader&, src: const u8[:], out: u8[>..]&) -> i64, bool {
     return read_windowed(r, src, out, MAX_IN_STEP);
 }
 
 // Decodes `src` in windows of at most `step` bytes. `read` uses this with
 // MAX_IN_STEP; tests use a smaller step to exercise the same path without a
 // 2 GiB input.
-fn read_windowed(r: Reader&, src: const u8[:], out: u8[>..]&, step: i64) -> i64, Status {
-    guard step > 0 && step <= MAX_INPUT else { return 0, Status.Overflow; }
-    guard r.state != ReaderState.Finished else { return 0, Status.BadState; }
+fn read_windowed(r: Reader&, src: const u8[:], out: u8[>..]&, step: i64) -> i64, bool {
+    guard step > 0 && step <= MAX_INPUT else { return 0, record_status(Status.Overflow); }
+    guard r.state != ReaderState.Finished else { return 0, record_status(Status.BadState); }
     // An empty source is legal: it is the drain call for a step-level caller
     // whose destination was smaller than the chunk, and a no-op otherwise.
     if src.len == 0 { return read_window(r, "", out); }
@@ -789,16 +884,16 @@ fn read_windowed(r: Reader&, src: const u8[:], out: u8[>..]&, step: i64) -> i64,
         if n > step { n = step; }
         let used, err = read_window(r, src[pos..pos + n], out);
         pos += used;
-        if err != Status.Ok { return pos, err; }
-        if used == 0 { return pos, Status.Ok; } // member done, or need more input
+        if !err { return pos, err; }
+        if used == 0 { return pos, true; } // member done, or need more input
     }
-    return pos, Status.Ok;
+    return pos, true;
 }
 
 // One window: feed igzip until it has taken every byte of `src` and drained
 // whatever it staged. A zero-progress result with input left would spin, so it
 // is a Status rather than a hang.
-fn read_window(r: Reader&, src: const u8[:], out: u8[>..]&) -> i64, Status {
+fn read_window(r: Reader&, src: const u8[:], out: u8[>..]&) -> i64, bool {
     var pos: i64 = 0;
     loop {
         var used:    u32 = 0;
@@ -807,12 +902,12 @@ fn read_window(r: Reader&, src: const u8[:], out: u8[>..]&) -> i64, Status {
         let rc = igzip_gs_reader_step(r, src[pos..], r.chunk, used, written, done);
         append_output(out, r.chunk, written);
         pos += used;
-        if rc != 0 { return pos, status_of(rc); }
-        if done { return pos, Status.Ok; }
+        if rc != 0 { return pos, record(rc); }
+        if done { return pos, true; }
         if used == 0 && written == 0 {
             // igzip has nothing left to give from these bytes.
-            if pos < src.len { return pos, Status.Other; }
-            return pos, Status.Ok;
+            if pos < src.len { return pos, record_status(Status.Other); }
+            return pos, true;
         }
     }
 }
@@ -835,19 +930,19 @@ fn finished(r: Reader&) -> bool {
 // A reader cannot be read from after this, and `reset` starts the next member.
 // A terminal error closes the body too, so `finish` after `Corrupt` is
 // `BadState` rather than a second verdict on a stream that is already dead.
-fn finish(r: Reader&) -> Status {
-    guard r.state != ReaderState.Finished else { return Status.BadState; }
+fn finish(r: Reader&) -> bool {
+    guard r.state != ReaderState.Finished else { return record_status(Status.BadState); }
     let done = finished(r);
     r.state = ReaderState.Finished;
-    if done { return Status.Ok; }
-    return Status.Truncated;
+    if done { return true; }
+    return record_status(Status.Truncated);
 }
 
 // Returns the reader to Fresh, keeping its wrapper and dropping any dictionary
 // and staged history. This is how a caller decodes a second concatenated member
 // and how a mid-stream copy recovers.
-fn reset(r: Reader&) -> Status {
-    return status_of(igzip_gs_reader_reset(r));
+fn reset(r: Reader&) -> bool {
+    return record(igzip_gs_reader_reset(r));
 }
 
 // Sets a preset dictionary. Legal in `Fresh`, and again in the one moment igzip
@@ -858,15 +953,15 @@ fn reset(r: Reader&) -> Status {
 // It also **never checks the dictionary against the stream's DICTID**: with a
 // gzip or zlib trailer a wrong dictionary is reported as `BadChecksum` at the
 // end, and on a raw stream it is not reported at all — the caller gets wrong
-// bytes with `Status.Ok`. Use a wrapper if the bytes must be trusted.
+// bytes with `true`. Use a wrapper if the bytes must be trusted.
 //
 // An empty dictionary is a no-op, as on a `Writer`: it cannot satisfy FDICT.
-fn set_dict(r: Reader&, dict: const u8[:]) -> Status {
-    return status_of(igzip_gs_reader_set_dict(r, dict));
+fn set_dict(r: Reader&, dict: const u8[:]) -> bool {
+    return record(igzip_gs_reader_set_dict(r, dict));
 }
 
 // Decodes one member into a destination the caller has already sized, and
-// returns `consumed, written, Status`. This is the only verb that can answer
+// returns `consumed, written, bool`. This is the only verb that can answer
 // `TooSmall`: igzip cannot say how large a member will be, so a caller that
 // knows (from a header, a length field, or a previous attempt) hands over its
 // room. `TooSmall` writes exactly `dst.len` bytes and leaves the reader `Fresh`,
@@ -874,12 +969,12 @@ fn set_dict(r: Reader&, dict: const u8[:]) -> Status {
 //
 // Trailing bytes after the member are left in `src`; the status does not claim
 // they were consumed. `inflated` is the verb that loops over members.
-fn inflate(r: Reader&, src: const u8[:], dst: u8[:]) -> i64, i64, Status {
-    guard r.state == ReaderState.Fresh else { return 0, 0, Status.BadState; }
+fn inflate(r: Reader&, src: const u8[:], dst: u8[:]) -> i64, i64, bool {
+    guard r.state == ReaderState.Fresh else { return 0, 0, record_status(Status.BadState); }
     var used:    u32 = 0;
     var written: u32 = 0;
     let rc = igzip_gs_reader_stateless(r, src, dst, used, written);
-    return used, written, status_of(rc);
+    return used, written, record(rc);
 }
 
 // Decodes every member in `src` into a new buffer.
@@ -894,18 +989,18 @@ fn inflate(r: Reader&, src: const u8[:], dst: u8[:]) -> i64, i64, Status {
 // not authenticated plaintext: check the status before using one. The reader's
 // totals describe the last member, because `reset` between members zeroes them;
 // `out.len` is the total and is not affected.
-fn inflated(r: Reader&, src: const u8[:]) -> u8[>..], Status {
+fn inflated(r: Reader&, src: const u8[:]) -> u8[>..], bool {
     var out: u8[>..] = [];
-    guard r.state == ReaderState.Fresh else { return out, Status.BadState; }
+    guard r.state == ReaderState.Fresh else { return out, record_status(Status.BadState); }
     var pos: i64 = 0;
     loop {
         let used, err = read(r, src[pos..], out);
         pos += used;
-        if err != Status.Ok { return out, err; }
+        if !err { return out, err; }
         if !finished(r) { break; }
         if pos == src.len { break; }
         let again = reset(r);
-        if again != Status.Ok { return out, again; }
+        if !again { return out, again; }
     }
     // Without this a stream that simply ran out would report success: `read`
     // treats "no more input yet" as Ok, and only here is it knowable that there
@@ -933,11 +1028,11 @@ fn tables() -> HuffTables {
 // Counts one sample body. Each call counts that body on its own: matches that
 // would span two samples are not found, so a table trained from many small
 // bodies reflects bodies, not the corpus as one long run.
-fn add(t: Trainer&, body: const u8[:]) -> Status {
+fn add(t: Trainer&, body: const u8[:]) -> bool {
     // Rejected rather than clamped: a silently shortened sample would train on
     // half a body and say nothing.
-    guard body.len <= MAX_INPUT else { return Status.Overflow; }
-    return status_of(igzip_gs_hist_add(t, body));
+    guard body.len <= MAX_INPUT else { return record_status(Status.Overflow); }
+    return record(igzip_gs_hist_add(t, body));
 }
 
 // Symbols counted so far. Check this against a floor before building a table
@@ -948,10 +1043,10 @@ fn symbols(t: Trainer&) -> i64 {
 
 // Builds the table. Every literal keeps a code, so a body containing bytes the
 // samples never saw still encodes.
-fn build(t: Trainer&) -> HuffTables, Status {
+fn build(t: Trainer&) -> HuffTables, bool {
     var tables = HuffTables { .. };
     let rc = igzip_gs_tables_build(t, tables);
-    return tables, status_of(rc);
+    return tables, record(rc);
 }
 
 // Copies the counts out, for keeping a content type's progress at 2.5 KB
@@ -985,21 +1080,8 @@ fn bound(n: i64) -> i64 {
     return igzip_gs_bound(n);
 }
 
-// Whether a call succeeded, so the common case reads as one condition:
-//
-//   let gz, err = c.compressed(body);
-//   guard err.ok() else { abort(igzip::status_name(err)); };
-//
-// A Status is not a condition in Goose — `guard err` is a type error, because
-// only a bool or an optional is — and this is the shortest spelling that is
-// one.
-fn ok(s: Status) -> bool {
-    return s == Status.Ok;
-}
-
 fn status_name(e: Status) -> const u8[:] {
     return match e {
-        Ok => "ok",
         Overflow => "input too large for igzip's 32-bit lengths",
         BadLevel => "compression level must be 0..3",
         BadLevelBuf => "igzip level buffer unusable",
@@ -1039,7 +1121,7 @@ fn trainer_size() -> i64 {
 //
 // A server keeps a `Compressor` per thread instead: this declares ~300 KB of
 // state inside the call.
-fn gzip(src: const u8[:], level: i32 = 1) -> u8[>..], Status {
+fn gzip(src: const u8[:], level: i32 = 1) -> u8[>..], bool {
     var c = gzip_compressor(level);
     var out: u8[>..] = [];
     let err = compress(c, src, out);
