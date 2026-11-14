@@ -1016,6 +1016,13 @@ fn status_name(e: Status) -> const u8[:] {
     };
 }
 
+// Renders a Status wherever text goes: `print(err)`, `str(err)`,
+// `abort(str("write failed: ", err))`. One table (`status_name`) decides the
+// words, so the two spellings cannot disagree.
+fn format(out: u8[>..]&, s: Status) {
+    format(out, status_name(s));
+}
+
 // The sizes the C side and the declarations above must agree on; the tests
 // compare them, so a struct change cannot pass unnoticed.
 fn compressor_size() -> i64 {

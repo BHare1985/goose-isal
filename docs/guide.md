@@ -330,6 +330,14 @@ A `Status` is not a condition in Goose — it takes a `bool` or an optional — 
 common case is `guard err.ok() else { ... }`, and a specific failure is
 `err == igzip::Status.BadTable`.
 
+It also prints itself, so a diagnostic needs no second call:
+
+```goose
+let err = w.finish(out);
+guard err.ok() else { abort(str("finish failed: ", err)); };
+```
+
+
 One thing to expect: a corrupted payload often comes back as `Ok` with the member
 unfinished rather than as an error, because igzip reports completion in a block
 state and cannot tell "not yet" from "not ever". That is what `finish` is for; a

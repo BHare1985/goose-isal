@@ -312,6 +312,24 @@ fn test_errors(body: const u8[:]) {
     assert(igzip::Status.Ok.ok());
     assert(!igzip::Status.BadLevel.ok());
     assert(c.compress(body, out).ok() || !c.compress(body, out).ok());
+
+    // Every variant names itself, and no two share a name. The loop comes from
+    // the enum's own metadata, so a variant added later cannot be forgotten
+    // here -- the match in status_name would not compile without an arm, and
+    // this catches the other half: an arm that says the same thing twice.
+    const for <N, V> in variants<igzip::Status> {
+        assert(igzip::status_name(V).len > 0);
+        const for <N2, W> in variants<igzip::Status> {
+            if N != N2 { assert(!(igzip::status_name(V) == igzip::status_name(W))); }
+        }
+    }
+
+    // The format overload renders the same words wherever text goes, so
+    // `print(err)` and `str("failed: ", err)` need no status_name call.
+    assert(str(igzip::Status.BadChecksum) == igzip::status_name(igzip::Status.BadChecksum));
+    assert(str(igzip::Status.Ok) == "ok");
+    // The spelling the guide recommends for a diagnostic.
+    assert(str("finish failed: ", igzip::Status.Truncated).len > "finish failed: ".len);
 }
 
 fn test_empty() {
