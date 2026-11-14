@@ -118,7 +118,9 @@ fn main() {
     qput(Job { records: SHARED_RECORDS });
     qput(Job { records: SHARED_RECORDS });
     for i in WORKERS { qput(Job { records: -1 }); }
-    for i in STREAM_JOBS { qput(StreamJob { records: ((i + 1) * 50) as i32 }); }
+    for i in STREAM_JOBS - 2 { qput(StreamJob { records: ((i + 1) * 50) as i32 }); }
+    qput(StreamJob { records: SHARED_RECORDS });
+    qput(StreamJob { records: SHARED_RECORDS });
     for i in STREAM_WORKERS { qput(StreamJob { records: -1 }); }
 
     var ids: i64[>..] = [];
@@ -146,12 +148,24 @@ fn main() {
     }
     guard shared_seen == 2 else { abort("the shared job did not come back twice"); };
 
-    // Streaming jobs go through the same typed queue, one result each.
+    // Streaming jobs go through the same typed queue, one result each. The
+    // two shared jobs must agree on size, as the Compressor jobs do.
+    var stream_shared_seen = 0;
+    var stream_shared_size: i32 = 0;
     for i in STREAM_JOBS {
         let r = qget<StreamResult>();
         guard r.code == 0 else { abort(str("stream worker failed on ", r.records, " records")); };
         guard r.size > 0 else { abort(str("empty stream result for ", r.records, " records")); };
+        if r.records == SHARED_RECORDS {
+            if stream_shared_seen == 0 {
+                stream_shared_size = r.size;
+            } else if r.size != stream_shared_size {
+                abort("two streaming workers disagreed on the size of the same input");
+            }
+            stream_shared_seen++;
+        }
     }
+    guard stream_shared_seen == 2 else { abort("the shared streaming job did not come back twice"); };
 
     for id in ids { thread_wait(id); }
     for id in stream_ids { thread_wait(id); }

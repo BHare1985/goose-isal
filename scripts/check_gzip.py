@@ -3,11 +3,12 @@
 
 A compressor that returns Ok with a plausible size can still emit a broken
 stream, so the Goose assertions are not enough on their own. This runs an
-independent decoder (CPython's zlib) over each artifact `test/contract.goose`
-and `test/streaming.goose` produced: one stream per wrapper and level, the sizes
-that sit on deflate's block boundaries, incompressible input, concatenated
-members, the trained stream, the empty input, custom headers, flush points,
-preset dictionaries and the stateful level-0 stream.
+independent decoder (CPython's zlib) over each artifact `test/contract.goose`,
+`test/writer_contract.goose` and `test/streaming.goose` produced: one stream
+per wrapper and level, the sizes that sit on deflate's block boundaries,
+incompressible input, concatenated members, the trained stream, the empty
+input, custom headers, flush points, preset dictionaries and the stateful
+level-0 stream.
 
 Artifacts are discovered, not listed, so adding a case on the Goose side needs
 no change here.
@@ -33,7 +34,7 @@ NAMED = {
     "trained.gz": 1,
     "empty.gz": 0,
 }
-EXPECTED_STREAMS = 40
+EXPECTED_STREAMS = 42
 
 
 def inflate(data: bytes, kind: str) -> bytes:
@@ -200,6 +201,9 @@ def main() -> int:
     c.check("stream/full_tail.deflate", "deflate", flush_b)
     sync_big = (stream / "sync_big.bin").read_bytes()
     c.check("stream/sync_big.gz", "gzip", sync_big * 2)
+    c.check("stream/sync_twice.gz", "gzip", flush_a)
+    medium = (stream / "medium.bin").read_bytes()
+    c.check("stream/medium.gz", "gzip", medium)
 
     # A Sync flush is a decode point: the prefix decodes to A on its own.
     prefix = (stream / "sync_prefix.gz").read_bytes()

@@ -24,10 +24,14 @@ one-shot 2 GiB limit.
   `Compressor`.
 - `Status.BadHeader`, `writer_size`, and lifecycle state (`Fresh`,
   `HeaderWritten`, `Open`, `Flushed`, `Finished`).
-- Tests: one-shot/chunked equivalence, Sync/Full decode points, custom and
-  large headers, zlib windows, dictionaries with and without the dictionary,
-  trained tables, lifecycle misuse, an initialized-writer copy guard, a 4.2 GiB stream,
-  a streaming thread worker, 15 new independently decoded streams, and
+- Tests split into `test/contract.goose` (one-shot), `test/writer_contract.goose`
+  (state, totals, headers, dictionaries, tables, copy guard), and
+  `test/streaming.goose` (equivalence, chunking, flush points, windows), with
+  shared generators in `test/support/`. Covers one-shot/chunked equivalence,
+  Sync/Full decode points, custom and 65 KiB headers, zlib windows,
+  dictionaries with and without the dictionary, trained tables and a mid-flush
+  swap, lifecycle misuse, initialized-writer copies, a 4.2 GiB stream,
+  two streaming thread workers, 17 new independently decoded streams (42 total), and
   stateful output-buffer/header stress cases under AddressSanitizer.
 
 ### Notes
