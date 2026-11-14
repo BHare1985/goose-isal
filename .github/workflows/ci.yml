@@ -145,6 +145,16 @@ jobs:
           goose build test/threads.goose -o "$RUNNER_TEMP/threads.exe"
           "$RUNNER_TEMP/threads.exe"
 
+      # While the Windows body difference is open, the failing run leaves the
+      # corrupt body and the worker's own generation behind; both are tiny.
+      - name: Windows thread bodies
+        if: runner.os == 'Windows' && failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-thread-bodies
+          path: build/tmp/win_*.bin
+          if-no-files-found: ignore
+
       - name: 4.2 GiB round trip (native)
         if: runner.os != 'Windows'
         shell: bash

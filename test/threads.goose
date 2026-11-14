@@ -11,6 +11,7 @@
 // two jobs carry the same input, so two different workers must report the same
 // compressed size.
 import std;
+import os;
 import igzip from "..";
 
 let WORKERS = 4;
@@ -177,6 +178,14 @@ thread_fn reader_worker() {
             show_around("  out", out, at);
             show_around("  body", body, at);
             show_diffs(out, body, 8);
+            // The two buffers whole, for whoever has to look at the pattern:
+            // the decoded bytes are what the main thread compressed, so this
+            // is the corrupt body beside the one this worker generated.
+            if box.records == 175 {
+                assert(make_dir("build/tmp"));
+                assert(write_file("build/tmp/win_out.bin", out));
+                assert(write_file("build/tmp/win_body.bin", body));
+            }
             code = 3;
         } else if !holder[0].finish() {
             code = 4;
