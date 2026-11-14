@@ -140,7 +140,7 @@ jobs:
           set -euo pipefail
           goose build test/threads.goose -o "$RUNNER_TEMP/threads.exe"
           out=$("$RUNNER_TEMP/threads.exe" 2>&1) && echo "$out" || {
-            echo "::warning title=threads on Windows::$(tr '\n' ' ' <<< "$out" | tail -c 200)"
+            echo "::warning title=threads on Windows::$(tr '\n' ' ' <<< "$out" | tail -c 400)"
           }
 
       - name: 4.2 GiB round trip (native)
@@ -166,6 +166,16 @@ jobs:
         run: |
           set -euo pipefail
           GOOSE_HOME="$HOME/.goose" make crosscheck
+
+      # Is the Windows threads difference about threads at all? This is the same
+      # package, built the same way, with no thread_fn and no queue.
+      - name: round trip under MSVC AOT (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          goose build test/roundtrip.goose -o "$RUNNER_TEMP/roundtrip.exe"
+          "$RUNNER_TEMP/roundtrip.exe"
 
       - name: examples typecheck
         shell: bash

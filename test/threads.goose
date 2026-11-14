@@ -152,6 +152,16 @@ thread_fn reader_worker() {
         } else if !holder[0].finished() {
             code = 2;
         } else if !same_bytes(out, body) {
+            // Say how it diverged: a different length points at the box or the
+            // queue, a same-length difference at the decode itself.
+            var at: i64 = -1;
+            var k:  i64 = 0;
+            while k < out.len && k < body.len {
+                if out[k] != body[k] { at = k; break; }
+                k++;
+            }
+            print("threads: mismatch records=", box.records, " box.len=", box.len,
+                  " out.len=", out.len, " body.len=", body.len, " at=", at);
             code = 3;
         } else if !holder[0].finish() {
             code = 4;
