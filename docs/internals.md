@@ -38,16 +38,17 @@ it cannot drift from the code being linked.
 ## The rule: C owns no memory
 
 Goose has no heap, so `src/igzip_shim.c` must not allocate. All igzip working
-state is the bytes of the `Compressor` and `Trainer` values Goose declared;
-`Histogram` and `HuffTables` are plain fixed-size values the caller owns. No
-`malloc`, no `free`, no `open`/`close`, no handle that can leak. Adding any of
-those needs a reason that survives review.
+state is the bytes of the `Compressor`, `Writer`, `Reader` and `Trainer` values
+Goose declared; `Histogram` and `HuffTables` are plain fixed-size values the
+caller owns. No `malloc`, no `free`, no `open`/`close`, no handle that can leak.
+Adding any of those needs a reason that survives review.
 
 Consequences that follow, and that repeatedly bite:
 
-- A `Compressor` passed **by value is a ~300 KB copy**, a `Writer` ~367 KB, and
-  a `Trainer` 19 KB. Functions that write take them by reference. `HuffTables`
-  and `Histogram` are small enough to pass and copy freely.
+- A `Compressor` passed **by value is a ~300 KB copy**, a `Writer` ~367 KB, a
+  `Reader` ~153 KB, and a `Trainer` 19 KB. Functions that write take them by
+  reference. `HuffTables` and `Histogram` are small enough to pass and copy
+  freely.
 - `goose.h` exports the builder types but no slice type. A `const u8[:]` arrives
   as a packed `{data, len}` pair, declared in the shim as `igzip_slice_u8`.
 - Appending writes at `out.stk->top` and then claims the bytes, mirroring
@@ -91,6 +92,55 @@ Each of these was measured, not assumed.
    copies in Goose and the shim checks the contract; passing a raw slice would
    silently omit the terminator.
 
+10. **Inflate reports completion in a block state, not a return code.**
+    `isal_inflate` folds `ISAL_END_INPUT` into `ISAL_DECOMP_OK`, so "ran out of
+    input" and "decoded a whole member" are the same return value. `finished`
+    reads `block_state == ISAL_BLOCK_FINISH`, and that is why `finish` exists: a
+    caller that never asks cannot tell a complete stream from a truncated one.
+11. **`ISAL_BLOCK_FINISH` implies the staging buffer is empty.** Measured over
+    200,000 one-byte-output calls: igzip only sets `FINISH` when
+    `tmp_out_valid == tmp_out_processed` (`igzip_inflate.c` ~2433), so nothing
+    can be held back at a member boundary and `finish` needs no output buffer.
+    The case that *does* leave bytes staged is the caller's destination filling
+    up, and `isal_inflate` with `avail_in == 0` copies them out on the next call
+    (measured: 4,053 bytes in one call) — that is `read(r, "", out)`.
+12. **The two families collide on return codes.** Inflate uses `-1` for
+    `ISAL_INVALID_BLOCK` and `-3` for `ISAL_INVALID_LOOKBACK`, which the deflate
+    status table reads as `STATELESS_OVERFLOW` and `ISAL_INVALID_STATE`. Worse,
+    ISA-L itself defines `ISAL_INVALID_STATE == ISAL_INVALID_LOOKBACK == -3`, so
+    the same number means different things on different calls. `reader_status`
+    translates the inflate family into `IGZIP_GS_*` codes in `-11..-15`, and
+    `isal_inflate_set_dict`'s `-3` is read as `BadState` where it is called.
+    One `status_of` table then serves both families.
+13. **`isal_inflate_stateless` is honest about `avail_out`.** Unlike
+    `isal_deflate_stateless` (behaviour 4), a destination one byte short returns
+    `ISAL_OUT_OVERFLOW` having written exactly `dst.len` bytes, and an exact-size
+    destination returns `ISAL_DECOMP_OK`. `scripts/read_stress.c` pins it. It
+    also does **not** call `isal_inflate_reset`: it clears a subset of fields
+    inline and leaves `tmp_out_processed`/`tmp_out_valid` alone, which is why the
+    stateless verb refuses a Reader that holds a dictionary instead of relying
+    on an undocumented side effect.
+14. **`isal_inflate_set_dict` may be called in two places**, guarded by
+    `block_state == ISAL_BLOCK_NEW_HDR && tmp_out_processed == tmp_out_valid` —
+    before any input, and immediately after `ISAL_NEED_DICT` (the zlib FDICT
+    path, where igzip has re-entered `NEW_HDR`). It copies at most the last
+    `IGZIP_HIST_SIZE` bytes and never looks at `total_out`. A zlib member with
+    FDICT reports `ISAL_NEED_DICT` **even when the dictionary is already set**,
+    because parsing the header is what notices; the shim decodes on in that case
+    rather than making every caller learn the sequence.
+15. **`dict_id` and `dict_length` are inert.** `igzip_inflate.c` stores
+    `dict_id` from the zlib header and never compares it to the dictionary
+    (2114 / 2257), and `dict_length` is written by the setter and both resets and
+    read by nothing. The dictionary works purely as `tmp_out_buffer` history, so
+    a wrong one is caught only by a gzip/zlib trailer. On `Wrapper.Raw` there is
+    no trailer and nothing catches it: wrong bytes, `Status.Ok`. That is
+    documented on `set_dict` and pinned by a test.
+16. **`isal_inflate_reset` keeps `crc_flag` and `hist_bits`** and clears
+    `wrapper_flag`, `dict_length`, `tmp_in_*`, `tmp_out_*`, the overflow cursors
+    and `total_out`. Keeping `crc_flag` is what makes the next concatenated
+    member's trailer still checked; `igzip_gs_reader_reset` rewrites it anyway so
+    the invariant is local.
+
 ### Streaming surface: what is exposed
 
 | ISA-L facility | Goose surface |
@@ -104,8 +154,13 @@ Each of these was measured, not assumed.
 | `IGZIP_GZIP`, `IGZIP_GZIP_NO_HDR`, `IGZIP_ZLIB`, `IGZIP_ZLIB_NO_HDR`, `IGZIP_DEFLATE` | `Wrapper` plus the explicit-header paths |
 | `isal_zstream.hist_bits` | `ZlibHeader.window_bits`; raw/gzip use the format default |
 | output staging and `avail_out` | the `Writer`'s 64 KiB `chunk`, drained by `write`/`flush`/`finish` |
+| `isal_inflate_init` / `isal_inflate` / `isal_inflate_reset` | `Reader`; `read`, `finished`, `finish`, `reset` |
+| `isal_inflate_stateless` | `inflate` (into a caller-sized slice) and, via the streaming loop, `inflated` |
+| `isal_inflate_set_dict` | `set_dict` (Fresh, or immediately after `NeedDict`) |
+| `ISAL_BLOCK_FINISH` | `finished(r)` |
+| input staging and `avail_out` | the `Reader`'s 64 KiB `chunk`, drained by `read` |
 
-Deliberately not exposed in 0.2, with the reason:
+Deliberately not exposed in 0.3, with the reason:
 
 - **`IGZIP_HUFFTABLE_STATIC`** — a table choice, not a streaming operation.
   Trained and default tables are the package's supported policy; this is an
@@ -120,13 +175,31 @@ Deliberately not exposed in 0.2, with the reason:
   `ISAL_DEF_LVL3_MEDIUM` (217,088 bytes), which satisfies levels 1-3 and is
   pinned by the layout. A smaller buffer would change the `Writer` size and
   compression decisions; it is not a 0.2 knob.
-- **`isal_inflate_*`, `isal_read_*`, checksums** — 0.3 and 0.4.
+- **`isal_read_gzip_header` / `isal_read_zlib_header`** — header *inspection*
+  (mtime, name, comment) is a different feature from decoding, and additive
+  later. The wrappers already validate what a reader must validate.
+- **`isal_inflate_stateless` with a dictionary** — ISA-L documents it as
+  dictionary-free; the reader refuses a dictionary-holding Reader rather than
+  depend on the history buffer surviving its partial reset.
+- **An expansion limit** — `read` plus `r.total_out` is a better one: a caller
+  stops feeding input when its own cap is passed, instead of being aborted
+  mid-member.
+- **Checksums** (`crc32_gzip_refl`, `isal_adler32`) — 0.4. igzip verifies the
+  trailer itself through `crc_flag`.
 
 The streaming values share `CHUNK_SIZE` and the `append_output` helper in
 `igzip.goose`: output is staged in a fixed chunk and only the bytes produced are
-appended. The same lazy-init plus `pinned_self` copy guard is the intended shape
-for another stateful value, and package-specific C statuses stay below ISA-L's
-range so the next error family can take a disjoint code.
+appended. `Writer` and `Reader` share the lazy-init plus `pinned_self` copy
+guard, and each family of C statuses has its own range — the deflate family at
+`-8`/`-10`, inflate at `-11..-15` — so `status_of` stays one table.
+
+The reader's phase rules are the part of 0.3 a caller can get wrong, so they are
+a matrix in [design/0.3.0.md](design/0.3.0.md) §5 Q11 and asserted cell by cell
+in `test/inflate_contract.goose`. Two rules hold it together: `read` never ends
+a body (a member boundary is `finished(r)`, not a state change, so a caller that
+stops feeding can resume), and a terminal error latches the Reader `Finished`,
+because `isal_inflate` would otherwise answer `Ok` forever from a `FINISH` block
+state.
 
 The zlib `window_bits` field is not cosmetic: the shim also sets
 `stream.hist_bits` to the same value before deflating. A 4 KiB window on the
@@ -157,6 +230,19 @@ Nothing from libdeflate belongs here, ever.
   deserialized `Writer` with `has_tables = true`, or a caller that mutates the
   public `tables` field, is checked at the use site. `clear_tables` remains
   available to drop a table that fails the check.
+- **A `Reader` never reads or writes past its buffers.** The destination is the
+  only limit on decompression, so `scripts/read_stress.c` decodes into buffers
+  allocated to their exact size, from 1 byte to 64 KiB, at every truncation
+  offset, through 400 mutations and the dictionary paths, under
+  AddressSanitizer. It also pins the assumption the API rests on — stateless
+  inflate is honest about `avail_out` — the one place this package trusts a
+  behaviour `isal_deflate_stateless` does not have.
+- **A truncated or corrupted stream is a `Status`, never a crash.** Truncation
+  is `finished(r) == false`, which `finish` reports as `Truncated`; corruption is
+  `Corrupt`, `BadChecksum` or `BadWrapper`, and each latches. A payload mutation
+  can also leave the member merely unfinished — igzip cannot tell "not yet" from
+  "not ever" — which is why a caller must call `finish` rather than only watch
+  for errors.
 - **A deserialized `Writer` is not trusted either.** A `Fresh` Writer whose
   `pinned_self` is zero but which carries `has_dict` or `hdr_written` has no C
   dictionary/header behind those flags; `writer_pin` returns `BadState` and
@@ -185,6 +271,12 @@ Nothing from libdeflate belongs here, ever.
   silently, the shim stores the Writer's address in `pinned_self` on first use
   and returns `BadState` when a later call arrives at a different address. A
   copy is recoverable with `reset`, which reinitializes the copied stream.
+- **A live Reader copy is rejected too**, for a different reason: no pointer into
+  Goose memory survives a reader call, so the copy is memory-safe, but both
+  copies would decode from the same position and emit the same bytes twice. One
+  rule for stateful values, and `reset` recovers the copy. A `Fresh` Reader
+  carrying `has_dict` with no pinned address is refused as deserialized or
+  forged: the history the flag names was never copied in.
 - **The header path has two sizes.** A header that fits in `chunk` is written
   there and appended. A larger one is first measured (`isal_write_gzip_header`
   returns the required size without touching the stream), then built in a
@@ -229,8 +321,15 @@ The boundary is `src/igzip_shim.c`; check these on every change that touches it.
 - `out.resize` while a struct with slice fields is still live is rejected if
   its views may point into `out`. Build large headers in a fresh temporary
   instead of resizing the caller's builder.
-- An enum with no payload is one byte. Store `Wrapper` and `WriterState`
-  directly; casting an `i32` to an enum is not allowed.
+- An enum with no payload is one byte. Store `Wrapper`, `WriterState` and
+  `ReaderState` directly; casting an `i32` to an enum is not allowed.
+- `resize` on a builder needs a fill value (`dst.resize(n, 0)`); there is no
+  zero-initializing overload for `u8[>..]`.
+- A multiple return has to be taken whole: `let used, err = r.read(..)`. Binding
+  only the first value and then calling `err.ok()` reports
+  `unknown function or member: ok`, because `err` was inferred as `i64`.
+- A status and a count from the same call cannot be compared with each other:
+  compare the status against `Status.Ok` and the count separately.
 
 ## Conventions
 

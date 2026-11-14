@@ -31,7 +31,7 @@ JIT_TESTS   := $(filter-out test/threads.goose test/large_stream.goose,$(sort $(
 THREAD_TEST := test/threads.goose
 LARGE_TEST  := test/large_stream.goose
 
-.PHONY: all check test test-threads test-large examples bench stress fmt fmt-check verify tools submodule clean
+.PHONY: all check test crosscheck test-threads test-large examples bench stress fmt fmt-check verify tools submodule clean
 
 all: check
 
@@ -49,11 +49,19 @@ tools: submodule
 check:
 	@$(GOOSE) check $(ENTRY)
 
-# Each JIT test is a root file that asserts and writes artifacts; the Python
-# step then inflates every stream it produced.
+# Each JIT test is a root file that asserts, and that now decodes what it wrote
+# with the package's own reader. No Python, no network: a compressor and a
+# decompressor wired to each other is the point of 0.3.0.
 test: submodule
 	@mkdir -p build/tmp
 	@for f in $(JIT_TESTS); do echo "== $$f"; $(GOOSE) run --debug "$$f" || exit 1; done
+
+# The independent decoder. A compressor and a decompressor that agree can agree
+# on a broken stream, so CPython's zlib still inflates every artifact the tests
+# wrote -- it is the only decoder here that is not ours. Optional: `make verify`
+# runs it when python3 is installed, and `make test` never needs it.
+crosscheck:
+	@command -v python3 >/dev/null 2>&1 || { echo "crosscheck: python3 not found, skipped"; exit 0; }
 	@python3 scripts/check_gzip.py
 
 # Workers need a native build: the JIT cannot place thread-local storage.
@@ -74,15 +82,25 @@ test-large: submodule
 examples: check
 	@for f in $(EXAMPLES); do echo "== $$f"; $(GOOSE) check "$$f" || exit 1; done
 
-# The output bound must hold as an *exact* buffer size, or igzip writes past the
-# end of the destination. Anything that changes the bound, the shim's buffers,
-# or the ISA-L version should be followed by this.
+# Two harnesses, both under AddressSanitizer with exactly sized buffers:
+#
+#   bound_stress  the output bound holds as an *exact* buffer size, or igzip
+#                 writes past the end of the destination
+#   read_stress   nothing is written past the destination or read past the
+#                 input, at chunk sizes from 1 byte up, across every truncation
+#                 offset, mutations, and the dictionary paths
+#
+# Anything that changes the bound, the shim's buffers, the reader's draining, or
+# the ISA-L version should be followed by this.
 stress:
 	@mkdir -p build
 	@lib=$$(find $(HOME)/.goose/build/pkg -path '*/cmake/pkg/vendor/isa-l/libisal.a' 2>/dev/null | head -1); \
 	if [ -z "$$lib" ]; then echo "build the package first: make test"; exit 1; fi; \
-	gcc -g -O1 -fsanitize=address -Ivendor/isa-l/include \
-		-o build/bound_stress scripts/bound_stress.c "$$lib" && ./build/bound_stress
+	for src in bound_stress read_stress; do \
+		echo "== scripts/$$src.c"; \
+		gcc -g -O1 -fsanitize=address -Ivendor/isa-l/include \
+			-o build/$$src scripts/$$src.c "$$lib" && ./build/$$src || exit 1; \
+	done
 
 # Throughput needs a native build; `goose run` timings mean nothing.
 bench: check
@@ -90,7 +108,7 @@ bench: check
 	@$(GOOSE) build examples/bench.goose -o build/bench
 	@./build/bench
 
-verify: check test test-threads test-large examples
+verify: check test crosscheck test-threads test-large examples
 	@echo "verify: ok"
 
 fmt:

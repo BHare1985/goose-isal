@@ -21,6 +21,13 @@
 //   let gz, err = c.compressed(body);          // fresh buffer
 //   c.compress(body, out);                     // or append to yours
 //
+// A reader does the reverse, one member at a time:
+//
+//   var r = igzip::gzip_reader();
+//   let used, err = r.read(gz, body);          // appends; reports consumption
+//   guard r.finished() else { /* feed more */ };
+//   guard r.finish().ok() else { /* truncated */ };
+//
 // Training a Huffman table on one class of body and reusing it for every later
 // body of that class is what makes level 0 pay off:
 //
@@ -40,6 +47,13 @@
 //     text poorly. Stay on level 1 until a table is trained.
 //   * One member per call. igzip's lengths are 32-bit, so inputs above 2 GiB
 //     are rejected rather than silently truncated.
+//   * Decompression reports completion in a block state, not a return code:
+//     igzip folds "ran out of input" into success, so `finished`/`finish` are
+//     the only way to tell a whole member from a truncated one. A corrupted
+//     payload can therefore come back as `Ok` with the member unfinished.
+//   * igzip never compares a supplied dictionary with the stream's DICTID, so a
+//     wrong one is caught by a gzip or zlib trailer and by nothing at all on a
+//     raw stream.
 namespace igzip;
 
 // ---------------------------------------------------------------------------
@@ -77,6 +91,11 @@ enum Status {
     BadWrapper,   // invalid flush or wrapper
     BadTable,     // the histogram produced an invalid table
     BadHeader,    // a gzip or zlib header this API cannot encode
+    Truncated,    // input ended before the member's final block
+    TooSmall,     // the destination had no room for the decoded bytes
+    NeedDict,     // a zlib stream requires a preset dictionary
+    Corrupt,      // the bytes are not a valid deflate stream
+    BadChecksum,  // the trailer does not match the decoded bytes
     Other,        // an igzip error this package does not name
 }
 
@@ -183,6 +202,37 @@ struct Writer {
 }
 
 // ---------------------------------------------------------------------------
+// Streaming reader
+// ---------------------------------------------------------------------------
+
+// The reader's lifecycle. `read` only ever moves `Fresh` to `Open`: a member
+// ending is a fact (`finished`), not a state change, because a caller that
+// stops feeding input may still resume. `finish` closes a body, and `reset`
+// makes the reader usable again.
+enum ReaderState {
+    Fresh,    // nothing read yet; a dictionary may be set
+    Open,     // mid-member, or at the end of one; `read` may continue
+    Finished, // the body was closed; only `reset` is legal
+}
+
+// A streaming inflater: 87,368 bytes of igzip state, a 64 KiB output staging
+// buffer, and its wrapper.
+//
+// Unlike a `Writer`, no pointer into this value is held between calls, so a copy
+// is memory-safe. It is still refused, because a copy would decode from the same
+// position and emit the same bytes twice without saying so; `reset` recovers it.
+struct Reader {
+    istate:      u64[10921]     = [0; 10921],
+    chunk:       u8[CHUNK_SIZE] = [0; CHUNK_SIZE],
+    pinned_self: u64            = 0,
+    total_in:    u64            = 0,
+    total_out:   u64            = 0,
+    wrap:        Wrapper        = Wrapper.Gzip,
+    state:       ReaderState    = ReaderState.Fresh,
+    has_dict:    bool           = false,
+}
+
+// ---------------------------------------------------------------------------
 // C surface (src/igzip_shim.c)
 // ---------------------------------------------------------------------------
 
@@ -216,6 +266,15 @@ extern fn igzip_gs_writer_clear_tables(w: Writer&) -> i32;
 extern fn igzip_gs_writer_step(w: Writer&, src: const u8[:], mode: u8, dst: u8[:],
     out_consumed: u32&, out_written: u32&, out_more: bool&) -> i32;
 
+extern fn igzip_gs_reader_size() -> i64;
+extern fn igzip_gs_reader_reset(r: Reader&) -> i32;
+extern fn igzip_gs_reader_finished(r: const Reader&) -> bool;
+extern fn igzip_gs_reader_set_dict(r: Reader&, dict: const u8[:]) -> i32;
+extern fn igzip_gs_reader_step(r: Reader&, src: const u8[:], dst: u8[:], out_consumed: u32&,
+    out_written: u32&, out_finished: bool&) -> i32;
+extern fn igzip_gs_reader_stateless(r: Reader&, src: const u8[:], dst: u8[:],
+    out_consumed: u32&, out_written: u32&) -> i32;
+
 fn wrapper_code(w: Wrapper) -> i32 {
     return match w {
         Raw => 0,
@@ -224,6 +283,10 @@ fn wrapper_code(w: Wrapper) -> i32 {
     };
 }
 
+// The one table every C return goes through. The inflate family's own codes are
+// translated in C into the -11..-15 range, because ISA-L reuses -1 and -3 for
+// different failures on the two sides of the codec and a table keyed on the
+// number alone cannot be right for both.
 fn status_of(rc: i32) -> Status {
     return match rc {
         0 => Status.Ok,
@@ -235,6 +298,11 @@ fn status_of(rc: i32) -> Status {
         -8 => Status.BadHeader,
         -9 => Status.BadState,
         -10 => Status.BadTable,
+        -11 => Status.Truncated,
+        -12 => Status.NeedDict,
+        -13 => Status.TooSmall,
+        -14 => Status.Corrupt,
+        -15 => Status.BadChecksum,
         _ => Status.Other,
     };
 }
@@ -513,6 +581,196 @@ fn clear_tables(w: Writer&) -> Status {
 }
 
 // ---------------------------------------------------------------------------
+// Streaming readers
+// ---------------------------------------------------------------------------
+
+// A reader for any wrapper. The state is initialized on first use, not here, so
+// returning the value from a function or storing it in an array cannot leave a C
+// pointer to a dead local.
+fn reader(wrap: Wrapper) -> Reader {
+    return Reader { wrap: wrap, .. };
+}
+
+fn gzip_reader() -> Reader {
+    return reader(Wrapper.Gzip);
+}
+
+fn zlib_reader() -> Reader {
+    return reader(Wrapper.Zlib);
+}
+
+fn raw_reader() -> Reader {
+    return reader(Wrapper.Raw);
+}
+
+// The exact byte size of a Reader, checked against the C mirror.
+fn reader_size() -> i64 {
+    return igzip_gs_reader_size();
+}
+
+// Decodes `src` into `out`, appending, and returns how many of `src`'s bytes
+// were consumed.
+//
+// Compression consumes everything it is given, so `write` returning a Status is
+// the whole story. Decompression stops at the end of a member and leaves the
+// rest of the slice alone, so the count is part of the result: `src[used..]` is
+// the next member or trailing bytes, and a caller that cannot see that would
+// re-feed or re-scan the buffer.
+//
+// The call ends when `src` is exhausted or a member ends. `finished(r)` is true
+// only in the second case, and at that point every decoded byte is already in
+// `out`. Two idioms follow from that:
+//
+//   let used, err = r.read(gz, body);        // one member, then a boundary
+//
+//   // Drain when the destination, not the input, ran out.
+//   let used, err = r.read("", body);
+//
+// Input beyond `MAX_INPUT` is split into windows, never rejected.
+fn read(r: Reader&, src: const u8[:], out: u8[>..]&) -> i64, Status {
+    return read_windowed(r, src, out, MAX_IN_STEP);
+}
+
+// Decodes `src` in windows of at most `step` bytes. `read` uses this with
+// MAX_IN_STEP; tests use a smaller step to exercise the same path without a
+// 2 GiB input.
+fn read_windowed(r: Reader&, src: const u8[:], out: u8[>..]&, step: i64) -> i64, Status {
+    guard step > 0 && step <= MAX_INPUT else { return 0, Status.Overflow; }
+    guard r.state != ReaderState.Finished else { return 0, Status.BadState; }
+    // An empty source is legal: it is how output igzip staged is drained when
+    // the destination, not the input, was the thing that ran out.
+    if src.len == 0 { return read_window(r, "", out); }
+
+    var pos: i64 = 0;
+    while pos < src.len {
+        var n = src.len - pos;
+        if n > step { n = step; }
+        let used, err = read_window(r, src[pos..pos + n], out);
+        pos += used;
+        if err != Status.Ok { return pos, err; }
+        if used == 0 { return pos, Status.Ok; } // member done, or need more input
+    }
+    return pos, Status.Ok;
+}
+
+// One window: feed igzip until it has taken every byte of `src` and drained
+// whatever it staged. A zero-progress result with input left would spin, so it
+// is a Status rather than a hang.
+fn read_window(r: Reader&, src: const u8[:], out: u8[>..]&) -> i64, Status {
+    var pos: i64 = 0;
+    loop {
+        var used:    u32 = 0;
+        var written: u32 = 0;
+        var done = false;
+        let rc = igzip_gs_reader_step(r, src[pos..], r.chunk, used, written, done);
+        append_output(out, r.chunk, written);
+        pos += used;
+        if rc != 0 { return pos, status_of(rc); }
+        if done { return pos, Status.Ok; }
+        if used == 0 && written == 0 {
+            // igzip has nothing left to give from these bytes.
+            if pos < src.len { return pos, Status.Other; }
+            return pos, Status.Ok;
+        }
+    }
+}
+
+// Whether a member ended. This is the completion predicate `isal_inflate`
+// cannot express through a return code: it folds `ISAL_END_INPUT` into success
+// and reports completion only in a block state.
+//
+// `Ok` from `read` plus `!finished(r)` is not an error: it means the caller
+// stopped feeding before the member ended. `finish` is what turns that into one.
+fn finished(r: Reader&) -> bool {
+    return igzip_gs_reader_finished(r);
+}
+
+// Closes the body and reports whether it was complete: `Truncated` if the
+// member's final block was never reached, `Ok` if it was. Takes no output
+// because `read` cannot return at a member boundary holding bytes back, so
+// there is nothing to drain.
+//
+// A reader cannot be read from after this; `reset` starts the next member.
+fn finish(r: Reader&) -> Status {
+    guard r.state != ReaderState.Finished else { return Status.BadState; }
+    let done = finished(r);
+    r.state = ReaderState.Finished;
+    if done { return Status.Ok; }
+    return Status.Truncated;
+}
+
+// Returns the reader to Fresh, keeping its wrapper and dropping any dictionary
+// and staged history. This is how a caller decodes a second concatenated member
+// and how a mid-stream copy recovers.
+fn reset(r: Reader&) -> Status {
+    return status_of(igzip_gs_reader_reset(r));
+}
+
+// Sets a preset dictionary. Legal in `Fresh`, and again in the one moment igzip
+// allows after decoding starts: right after `Status.NeedDict`, when the zlib
+// header has been parsed and nothing has been emitted.
+//
+// igzip copies the last 32 KiB, so the slice does not have to outlive the call.
+// It also **never checks the dictionary against the stream's DICTID**: with a
+// gzip or zlib trailer a wrong dictionary is reported as `BadChecksum` at the
+// end, and on a raw stream it is not reported at all — the caller gets wrong
+// bytes with `Status.Ok`. Use a wrapper if the bytes must be trusted.
+//
+// An empty dictionary is a no-op, as on a `Writer`: it cannot satisfy FDICT.
+fn set_dict(r: Reader&, dict: const u8[:]) -> Status {
+    return status_of(igzip_gs_reader_set_dict(r, dict));
+}
+
+// Decodes one member into a destination the caller has already sized, and
+// returns `consumed, written, Status`. This is the only verb that can answer
+// `TooSmall`: igzip cannot say how large a member will be, so a caller that
+// knows (from a header, a length field, or a previous attempt) hands over its
+// room. `TooSmall` writes exactly `dst.len` bytes and leaves the reader `Fresh`,
+// so a retry with a bigger slice needs no `reset`.
+//
+// Trailing bytes after the member are left in `src`; the status does not claim
+// they were consumed. `inflated` is the verb that loops over members.
+fn inflate(r: Reader&, src: const u8[:], dst: u8[:]) -> i64, i64, Status {
+    guard r.state == ReaderState.Fresh else { return 0, 0, Status.BadState; }
+    var used:    u32 = 0;
+    var written: u32 = 0;
+    let rc = igzip_gs_reader_stateless(r, src, dst, used, written);
+    return used, written, status_of(rc);
+}
+
+// Decodes every member in `src` into a new buffer.
+//
+// This drives the streaming loop rather than the stateless call: a fresh builder
+// cannot be sized ahead of time, the streaming path needs no guess, and it is
+// what lets a dictionary work here. Concatenated members are joined; trailing
+// bytes after the last member are an error (`BadWrapper`), never silently
+// dropped.
+//
+// On a non-`Ok` status the bytes decoded so far are returned beside it. They are
+// not authenticated plaintext: check the status before using one. The reader's
+// totals describe the last member, because `reset` between members zeroes them;
+// `out.len` is the total and is not affected.
+fn inflated(r: Reader&, src: const u8[:]) -> u8[>..], Status {
+    var out: u8[>..] = [];
+    guard r.state == ReaderState.Fresh else { return out, Status.BadState; }
+    var pos: i64 = 0;
+    loop {
+        let used, err = read(r, src[pos..], out);
+        pos += used;
+        if err != Status.Ok { return out, err; }
+        if !finished(r) { break; }
+        if pos == src.len { break; }
+        let again = reset(r);
+        if again != Status.Ok { return out, again; }
+    }
+    // Without this a stream that simply ran out would report success: `read`
+    // treats "no more input yet" as Ok, and only here is it knowable that there
+    // is no more input coming.
+    let err = finish(r);
+    return out, err;
+}
+
+// ---------------------------------------------------------------------------
 // Training
 // ---------------------------------------------------------------------------
 
@@ -601,10 +859,15 @@ fn status_name(e: Status) -> const u8[:] {
         Overflow => "input too large for igzip's 32-bit lengths",
         BadLevel => "compression level must be 0..3",
         BadLevelBuf => "igzip level buffer unusable",
-        BadState => "call is not allowed in this writer state",
+        BadState => "call is not allowed in this state",
         BadWrapper => "invalid flush or wrapper",
         BadTable => "histogram produced an invalid table",
         BadHeader => "gzip or zlib header field cannot be encoded",
+        Truncated => "input ended before the end of the member",
+        TooSmall => "destination had no room for the decoded bytes",
+        NeedDict => "stream needs a preset dictionary",
+        Corrupt => "bytes are not a valid deflate stream",
+        BadChecksum => "trailer does not match the decoded bytes",
         Other => "igzip reported an error this package does not name",
     };
 }

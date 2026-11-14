@@ -66,21 +66,35 @@ separate `Writer` (367,280 B), not a mode on `Compressor`:
   cases, `test/streaming.goose` for end-to-end behavior, and
   `test/support/` for shared generators; 43 streams are independently decoded.
 
-## 0.3.0 — inflate
+## Shipped: 0.3.0 — inflate
 
 **Design brief: [docs/design/0.3.0.md](docs/design/0.3.0.md).**
 
 The other half of the codec, and the point at which the package can test itself
-instead of leaning on a Python decoder.
+instead of leaning on a Python decoder. A `Reader` (152,936 B) rather than a
+mode on `Compressor`, because inflate's contract is different in three ways the
+API now states outright:
 
-- `isal_inflate` (stateful) with an `Inflater` value matching `Deflater`,
-  buffering output chunks through `gs_bld_append`, plus `isal_inflate_reset` for
-  concatenated members.
-- `isal_inflate_stateless` for whole-buffer reads.
-- `isal_inflate_set_dictionary`; truncated input reported as its own `Status`,
-  not as corruption.
-- Round-trip becomes a Goose test: the first version whose tests need no
-  `scripts/check_gzip.py`.
+| Area | Contents |
+|---|---|
+| Reading | `Reader` + `read` / `finished` / `finish` / `reset`; `read_windowed`; input above `MAX_INPUT` split into windows |
+| One-shot | `inflate` (one member into a caller-sized slice, `TooSmall` on a short one) and `inflated` (every member, fresh buffer) |
+| Dictionaries | `set_dict` in `Fresh`, and again right after `NeedDict`, which is the zlib FDICT path |
+| Errors | `Truncated`, `TooSmall`, `NeedDict`, `Corrupt`, `BadChecksum`; a terminal error latches the reader |
+| Values | `Reader` (152,936 B) beside `Writer` (367,280 B) and `Compressor` (299,472 B) |
+| Tests | `test/roundtrip.goose` (every wrapper × level × size, decoded ten ways), `test/inflate_contract.goose` (the transition matrix and hostile input), `scripts/read_stress.c`, and a 4.2 GiB round trip |
+
+Four facts the implementation is built on, all measured rather than assumed:
+completion is `block_state == ISAL_BLOCK_FINISH` and not a return code (igzip
+folds `ISAL_END_INPUT` into success); `FINISH` is only set once the staging
+buffer is provably empty; the two halves of the codec collide on `-1` and `-3`,
+so the shim translates inflate's codes into their own range; and
+`isal_inflate_stateless` is honest about `avail_out` where
+`isal_deflate_stateless` is not.
+
+`make test` is now self-hosting — every stream the suite writes is decoded by the
+package — and `scripts/check_gzip.py` became `make crosscheck`, because a
+compressor and a decompressor that agree can still agree on something broken.
 
 ## 0.4.0 — the two checksums gzip needs
 
