@@ -16,11 +16,18 @@ behaviours the API encodes, the security notes, and the FFI review gates — is 
 | `CMakeLists.txt` | Builds the shim and ISA-L from `vendor/isa-l` (pinned submodule) |
 | `test/contract.goose` | One-shot contract tests; asserts and writes artifacts for `scripts/check_gzip.py` |
 | `test/writer_contract.goose` | `Writer` state, totals, headers, dictionaries, tables, copy guard and lifecycle errors |
+| `test/inflate_contract.goose` | `Reader` state machine, statuses, dictionaries, hostile input |
+| `test/header_contract.goose` | Headers both ways: write then read back, and every malformed one |
+| `test/roundtrip.goose` | Every wrapper, level and size, each stream decoded ten ways |
 | `test/streaming.goose` | End-to-end streaming: equivalence, chunking, flush points and input windows |
 | `test/support/support.goose` | Shared corpus/body/noise generators and byte comparison for the test roots |
 | `test/threads.goose`, `test/large_stream.goose` | Native-only worker and 4.2 GiB tests |
 | `examples/*.goose` | Runnable root programs: bench, gzip_file, trained_table |
-| `scripts/`, `docs/` | Verification scripts and maintainer docs |
+| `scripts/` | Verification harnesses: `check_gzip.py` (independent decode), `bound_stress.c`, `read_stress.c` |
+| `docs/guide.md` | How to use the package, with the reasoning |
+| `docs/coverage.md` | `igzip_lib.h` surface → this package, plus what is left out and why |
+| `docs/verification.md` | What `make verify` proves, file by file |
+| `docs/internals.md`, `docs/design/` | Maintainer invariants and the design briefs |
 
 ## Commands
 

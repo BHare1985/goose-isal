@@ -5,9 +5,10 @@
 igzip is a well-defined part of ISA-L rather than a slice of its API surface:
 its own header (`include/igzip_lib.h`, which includes nothing but `<stdint.h>`),
 its own sources under `igzip/`, and one outside dependency — the CRC-32 and
-Adler-32 kernels in `crc/`, which gzip and zlib trailers use. That dependency is
-the reason the checksums are in this package's scope: a gzip codec cannot verify
-a trailer without them.
+Adler-32 kernels in `crc/`, which gzip and zlib trailers use. igzip calls those
+itself to verify a trailer; this package therefore relies on them without
+exposing them, which is the boundary [docs/coverage.md](docs/coverage.md)
+records.
 
 So the end state is a complete, fast gzip/zlib/deflate codec in Goose, and every
 version keeps the same shape:
@@ -66,45 +67,49 @@ separate `Writer` (367,280 B), not a mode on `Compressor`:
   cases, `test/streaming.goose` for end-to-end behavior, and
   `test/support/` for shared generators; 43 streams are independently decoded.
 
-## Shipped: 0.3.0 — inflate
+## Shipped: 0.3.0 — the complete codec
 
 **Design brief: [docs/design/0.3.0.md](docs/design/0.3.0.md).**
 
-The other half of the codec, and the point at which the package can test itself
-instead of leaning on a Python decoder. A `Reader` (152,936 B) rather than a
-mode on `Compressor`, because inflate's contract is different in three ways the
-API now states outright:
+Inflate, which is the other half of the codec, and header reading, which closes
+the last capability gap against `igzip_lib.h`. With this release a caller can do
+everything igzip can do: compress and decompress, streaming or one-shot, write
+and read a container header, train a table, and set a dictionary.
 
 | Area | Contents |
 |---|---|
-| Reading | `Reader` + `read` / `finished` / `finish` / `reset`; `read_windowed`; input above `MAX_INPUT` split into windows |
+| Reading | `Reader` (152,936 B) + `read` / `finished` / `finish` / `reset`; `read_windowed`; input above `MAX_INPUT` split into windows |
 | One-shot | `inflate` (one member into a caller-sized slice, `TooSmall` on a short one) and `inflated` (every member, fresh buffer) |
-| Dictionaries | `set_dict` in `Fresh`, and again right after `NeedDict`, which is the zlib FDICT path |
+| Headers | `read_gzip_header` / `read_zlib_header` → `GzipInfo` / `ZlibInfo`: fields plus offsets for name, comment, extra and the body, parsed in Goose over a slice |
+| Dictionaries | `set_dict` in `Fresh`, and again right after `NeedDict` — the zlib FDICT path, both directions |
 | Errors | `Truncated`, `TooSmall`, `NeedDict`, `Corrupt`, `BadChecksum`; a terminal error latches the reader |
-| Values | `Reader` (152,936 B) beside `Writer` (367,280 B) and `Compressor` (299,472 B) |
-| Tests | `test/roundtrip.goose` (every wrapper × level × size, decoded ten ways), `test/inflate_contract.goose` (the transition matrix and hostile input), `scripts/read_stress.c`, and a 4.2 GiB round trip |
+| Tests | `test/roundtrip.goose`, `test/inflate_contract.goose`, `test/header_contract.goose`, `scripts/read_stress.c`, a 4.2 GiB round trip, and `make test` no longer needing Python |
 
-Four facts the implementation is built on, all measured rather than assumed:
+Five facts the implementation is built on, all measured rather than assumed:
 completion is `block_state == ISAL_BLOCK_FINISH` and not a return code (igzip
-folds `ISAL_END_INPUT` into success); `FINISH` is only set once the staging
-buffer is provably empty; the two halves of the codec collide on `-1` and `-3`,
-so the shim translates inflate's codes into their own range; and
-`isal_inflate_stateless` is honest about `avail_out` where
-`isal_deflate_stateless` is not.
+folds `ISAL_END_INPUT` into success); `FINISH` is only set once the staging buffer
+is provably empty; the two halves of the codec collide on `-1` and `-3`, so the
+shim translates inflate's codes into their own range; `isal_inflate_stateless` is
+honest about `avail_out` where `isal_deflate_stateless` is not; and a corrupted
+payload usually surfaces as `Ok` with the member unfinished, which is why
+`finish` exists.
 
-`make test` is now self-hosting — every stream the suite writes is decoded by the
-package — and `scripts/check_gzip.py` became `make crosscheck`, because a
-compressor and a decompressor that agree can still agree on something broken.
+`docs/coverage.md` is the map from `igzip_lib.h` to this package, including the
+four things deliberately left out and why.
 
-## 0.4.0 — the two checksums gzip needs
+### What is not in 0.3.0, and not coming
 
-Small, and already linked: igzip calls these itself, so exposing them costs
-nothing and lets a caller verify a trailer or build an ETag.
+**Checksums.** The plan had a 0.4.0 for `crc32_gzip_refl` and `isal_adler32`. It
+is dropped rather than deferred. igzip verifies a gzip or zlib trailer itself,
+so a caller already learns whether a stream is intact from the `Reader`; a caller
+who wants a CRC *value* wants a checksum library, and `crc.h` also holds `crc16`,
+`crc64` and `crc32c`, which no gzip stream needs. The boundary this package keeps
+is: it verifies checksums, it does not compute them. Reasoning in
+[docs/coverage.md](docs/coverage.md#the-checksum-decision).
 
-- `crc32_gzip_refl` and `isal_adler32`, one-shot over `const u8[:]` plus an
-  incremental form for a stream read in pieces.
-- `crc32_ieee` if a caller wants the non-reflected variant for a container
-  format; nothing else from `crc.h`.
+Also out by decision, all additive and all listed with their cost in
+[coverage.md](docs/coverage.md): subset Huffman tables, the preprocessed
+dictionary cache, and `IGZIP_HUFFTABLE_STATIC`.
 
 ## 1.0.0 — stable
 
@@ -125,6 +130,7 @@ own API shape:
 | `erasure_code.h`, `raid.h` | storage-system APIs built around caller-owned pointer arrays, which Goose does not have; a design problem of their own |
 | `mem_routines.h` | risks being slower than libc at small sizes, and Goose's own aggregated copies already cover the common case |
 | `crc16`, `crc64`, `crc32c` | no gzip stream needs them |
+| `crc32_gzip_refl`, `isal_adler32` | the trailer check, so a caller does not need one; a caller who wants a checksum value wants a checksum library, and this package verifies rather than computes (see [docs/coverage.md](docs/coverage.md#the-checksum-decision)) |
 | libdeflate | a different library entirely; a caller that wants it adds its own binding |
 
 ## Decision record

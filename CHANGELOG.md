@@ -26,11 +26,20 @@ tests no longer need an external decoder.
   `NeedDict`. igzip never compares a dictionary with the stream's DICTID, so a
   wrong one surfaces at the trailer — or, on a raw stream, not at all. That is
   documented on the function and pinned by a test.
+- `read_gzip_header` / `read_zlib_header` → `GzipInfo` / `ZlibInfo`, which close
+  the last capability gap against `igzip_lib.h`: the container can now be read as
+  well as written. The parts (name, comment, extra, and where the deflate stream
+  starts) are reported as offsets into the caller's buffer — no copy, no view to
+  dangle — and every length in an untrusted header is checked against the bytes
+  present. `docs/coverage.md` maps the whole `igzip_lib.h` surface, including
+  what is deliberately left out and why.
 - `test/roundtrip.goose` (every wrapper, level, size and chunk size, decoded ten
   ways), `test/inflate_contract.goose` (the transition matrix, statuses,
-  dictionaries, hostile input), `scripts/read_stress.c` (AddressSanitizer over
-  every truncation offset, 400 mutations and the dictionary paths), and reader
-  coverage in the streaming, writer-contract, threading and 4.2 GiB tests.
+  dictionaries, hostile input), `test/header_contract.goose` (headers both
+  directions, and every malformed one), `scripts/read_stress.c`
+  (AddressSanitizer over every truncation offset, 400 mutations and the
+  dictionary paths), and reader coverage in the streaming, writer-contract,
+  threading and 4.2 GiB tests.
 
 ### Changed
 
@@ -44,6 +53,10 @@ tests no longer need an external decoder.
   `test/writer_contract.goose` decode their own artifacts as they write them.
 - `examples/gzip_file.goose` reads its output back before reporting success.
 - `status_name(BadState)` says "this state" rather than "this writer state".
+- The documentation was split by audience: `README.md` is the front page and the
+  API tables, `docs/guide.md` is how to use it, `docs/coverage.md` is what igzip
+  exposes and what this package does with it, `docs/verification.md` is what the
+  tests prove, and `docs/internals.md` stays for maintainers.
 
 ## 0.2.0 — 2026-11-13
 

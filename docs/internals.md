@@ -1,8 +1,11 @@
 # Internals
 
 How the package is put together, and the invariants that are not obvious from
-reading a single file. `README.md` is for people *using* the package; this is
-for people *changing* it.
+reading a single file. [README.md](../README.md) and
+[guide.md](guide.md) are for people *using* the package;
+[coverage.md](coverage.md) says what igzip can do and what this package does with
+it; [verification.md](verification.md) says what the tests prove. This file is
+for people *changing* the package.
 
 ## The native part
 
@@ -138,7 +141,25 @@ Each of these was measured, not assumed.
     a wrong one is caught only by a gzip/zlib trailer. On `Wrapper.Raw` there is
     no trailer and nothing catches it: wrong bytes, `Status.Ok`. That is
     documented on `set_dict` and pinned by a test.
-16. **`isal_inflate_reset` keeps `crc_flag` and `hist_bits`** and clears
+16. **A gzip or zlib header is parsed in Goose, not by ISA-L.** `read_gzip_header`
+    and `read_zlib_header` walk the container themselves over a `const u8[:]` and
+    report *offsets* into it. `isal_read_gzip_header` would have been the
+    alternative, but it copies the name, comment and extra field into
+    caller-provided buffers, which means either a 65 KiB temporary or a caller
+    who has to size three builders to read four numbers. Parsing over a slice has
+    no pointers to get wrong, and every length in the header is a claim checked
+    against the bytes present before it is used. The decoder is the authority on
+    where the body starts, which is what makes `body_at` testable: the bytes from
+    it decode as a standalone raw stream.
+17. **Header CRCs are reported, not verified, and checksums are not exposed.**
+    `isal_inflate` steps over FHCRC, so verifying it in `read_gzip_header` and
+    not in the decoder would make the package disagree with itself. And while
+    igzip uses `isal_adler32` (zlib DICTID, trailer) and `crc32_gzip_refl`
+    (gzip trailer) internally, neither is part of this package's surface: a
+    caller who wants a CRC has a library for it, and one who wants to know
+    whether a stream is intact asks the `Reader`, which already answers
+    `BadChecksum`. [coverage.md](coverage.md) records the boundary.
+18. **`isal_inflate_reset` keeps `crc_flag` and `hist_bits`** and clears
     `wrapper_flag`, `dict_length`, `tmp_in_*`, `tmp_out_*`, the overflow cursors
     and `total_out`. Keeping `crc_flag` is what makes the next concatenated
     member's trailer still checked; `igzip_gs_reader_reset` rewrites it anyway so
@@ -160,6 +181,7 @@ Each of these was measured, not assumed.
 | `isal_inflate_init` / `isal_inflate` / `isal_inflate_reset` | `Reader`; `read`, `finished`, `finish`, `reset` |
 | `isal_inflate_stateless` | `inflate` (into a caller-sized slice) and, via the streaming loop, `inflated` |
 | `isal_inflate_set_dict` | `set_dict` (Fresh, or immediately after `NeedDict`) |
+| `isal_read_gzip_header` / `isal_read_zlib_header` | `read_gzip_header` / `read_zlib_header`, parsed in Goose over a slice and returning offsets rather than copies |
 | `ISAL_BLOCK_FINISH` | `finished(r)` |
 | input staging and `avail_out` | the `Reader`'s 64 KiB `chunk`, drained by `read` |
 
@@ -187,8 +209,14 @@ Deliberately not exposed in 0.3, with the reason:
 - **An expansion limit** — `read` plus `r.total_out` is a better one: a caller
   stops feeding input when its own cap is passed, instead of being aborted
   mid-member.
-- **Checksums** (`crc32_gzip_refl`, `isal_adler32`) — 0.4. igzip verifies the
-  trailer itself through `crc_flag`.
+- **Checksums** (`crc32_gzip_refl`, `isal_adler32`, and the rest of `crc.h`).
+  This package verifies checksums and does not compute them: igzip checks a
+  trailer itself through `crc_flag`, and a caller who needs a CRC value has a
+  library for it. [coverage.md](coverage.md) has the reasoning in full.
+- **`isal_create_hufftables_subset`, `isal_deflate_process_dict` /
+  `isal_deflate_reset_dict`, `IGZIP_HUFFTABLE_STATIC`** — a table-policy knob, a
+  dictionary cache, and a third table source. Each is additive and each is
+  listed with its cost in [coverage.md](coverage.md).
 
 The streaming values share `CHUNK_SIZE` and the `append_output` helper in
 `igzip.goose`: output is staged in a fixed chunk and only the bytes produced are
@@ -337,7 +365,11 @@ The boundary is `src/igzip_shim.c`; check these on every change that touches it.
 ## Conventions
 
 - Public functions live in `igzip.goose`, documented above the declaration with
-  *why*, not *what*.
+  *why*, not *what*. `igzip.goose` is ordered the way a reader meets it:
+  compressor, writer, reader, headers, training, diagnostics.
+- Prose that explains *how to use* the package belongs in `docs/guide.md`; the
+  README is a front page and the API tables. A behaviour that a maintainer must
+  not undo belongs here.
 - `Status` is the only failure channel. Every C call goes through `status_of`;
   igzip's negative codes never escape.
 - Validate in Goose when the check is about the API contract (level range, input
