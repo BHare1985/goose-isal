@@ -8,6 +8,11 @@
 # ISA-L itself is fine on all four: its CMake picks nasm's format per platform
 # (elf64 / macho64 / win64) and has aarch64 kernels for Apple Silicon.
 #
+# The two macOS legs need macOS runners, which GitHub allocates per account: if
+# a job is cancelled within a second of starting with no runner assigned, that
+# is the account's macOS access (billing or a spending limit), not this file.
+# The Linux and Windows legs run anywhere.
+#
 # What each job proves: the package typechecks, the C compiles against the
 # vendored ISA-L (which is the part that differs per platform -- assembly
 # format, thread-local spelling, MSVC), the round trip decodes, and the two
