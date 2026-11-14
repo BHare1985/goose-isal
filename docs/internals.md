@@ -119,7 +119,10 @@ Each of these was measured, not assumed.
     the same number means different things on different calls. `reader_status`
     translates the inflate family into `IGZIP_GS_*` codes in `-11..-15`, and
     `isal_inflate_set_dict`'s `-3` is read as `BadState` where it is called.
-    One `status_of` table then serves both families.
+    One `status_of` table then serves both families. Both tables are keyed on
+    numbers ISA-L owns, so every one of them is `_Static_assert`ed in the shim:
+    a renumbering there would otherwise turn `BadChecksum` into `BadState`, or
+    a zlib stream into a raw one, without failing to compile anywhere.
 13. **`isal_inflate_stateless` is honest about `avail_out`.** Unlike
     `isal_deflate_stateless` (behaviour 4), a destination one byte short returns
     `ISAL_OUT_OVERFLOW` having written exactly `dst.len` bytes, and an exact-size

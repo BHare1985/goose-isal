@@ -152,6 +152,51 @@ _Static_assert(offsetof(GooseWriter, has_tables) == 367274, "Writer.has_tables o
 _Static_assert(offsetof(GooseWriter, has_dict) == 367275, "Writer.has_dict offset");
 _Static_assert(offsetof(GooseWriter, hdr_written) == 367276, "Writer.hdr_written offset");
 
+/* The numbers Goose's two status tables are keyed on, and the wrapper codes
+ * wrapper_code() returns. They are ISA-L's to change, and a change would not
+ * fail to compile anywhere else: it would quietly turn BadChecksum into
+ * BadState, or a zlib stream into a deflate one. Assert them here, where the
+ * tables are built.
+ *
+ * Two of this package's own codes sit inside ISA-L's range -- -7 for BadWrapper
+ * and -8 for BadHeader -- and are safe only because ISA-L's own -7
+ * (INVALID_FLUSH) and -8 (INVALID_PARAM) are unreachable from the calls this
+ * file makes: the flush and the table type are validated here first. Since
+ * 2.32.1 never returns INVALID_PARAM from igzip/, -8 is free; -9
+ * (ISAL_INVALID_OPERATION) is reachable from isal_deflate_set_hufftables, which
+ * is why -9 maps to BadState. */
+_Static_assert(IGZIP_DEFLATE == 0, "wrapper_code() returns 0 for Wrapper.Raw");
+_Static_assert(IGZIP_GZIP == 1, "wrapper_code() returns 1 for Wrapper.Gzip");
+_Static_assert(IGZIP_ZLIB == 3, "wrapper_code() returns 3 for Wrapper.Zlib");
+_Static_assert(ISAL_DEF_HIST_SIZE == 32768, "the history window the docs promise");
+
+/* status_of in igzip.goose: deflate's codes. */
+_Static_assert(COMP_OK == 0, "status_of maps 0 to Ok");
+_Static_assert(STATELESS_OVERFLOW == -1, "status_of maps -1 to Overflow");
+_Static_assert(ISAL_INVALID_STATE == -3, "status_of maps -3 to BadState");
+_Static_assert(ISAL_INVALID_LEVEL == -4, "status_of maps -4 to BadLevel");
+_Static_assert(ISAL_INVALID_LEVEL_BUF == -5, "status_of maps -5 to BadLevelBuf");
+_Static_assert(INVALID_FLUSH == -7, "status_of maps -7 to BadWrapper");
+_Static_assert(INVALID_PARAM == -8, "IGZIP_GS_BAD_HEADER is -8 and must stay free");
+_Static_assert(ISAL_INVALID_OPERATION == -9, "status_of maps -9 to BadState");
+
+/* reader_status: inflate's codes. -1 and -3 mean something else here than they
+ * do above, which is the whole reason the reader has its own translator. */
+_Static_assert(ISAL_DECOMP_OK == 0, "reader_status maps 0 to Ok");
+_Static_assert(ISAL_END_INPUT == 1, "reader_status maps 1 to Truncated");
+_Static_assert(ISAL_OUT_OVERFLOW == 2, "reader_status maps 2 to TooSmall");
+_Static_assert(ISAL_NEED_DICT == 6, "reader_status maps 6 to NeedDict");
+_Static_assert(ISAL_INVALID_BLOCK == -1, "reader_status maps -1 to Corrupt");
+_Static_assert(ISAL_INVALID_SYMBOL == -2, "reader_status maps -2 to Corrupt");
+_Static_assert(ISAL_INVALID_LOOKBACK == -3, "reader_status maps -3 to Corrupt");
+_Static_assert(ISAL_INVALID_WRAPPER == -4, "reader_status maps -4 to BadWrapper");
+_Static_assert(ISAL_UNSUPPORTED_METHOD == -5, "reader_status maps -5 to BadWrapper");
+_Static_assert(ISAL_INCORRECT_CHECKSUM == -6, "reader_status maps -6 to BadChecksum");
+
+/* The state finished() reads, and the one set_dict's guard reads. */
+_Static_assert(ISAL_BLOCK_NEW_HDR == 0, "set_dict is legal only at NEW_HDR");
+_Static_assert(ISAL_BLOCK_FINISH == 5, "finished() reads ISAL_BLOCK_FINISH");
+
 _Static_assert(sizeof(igzip_comp_state) % 8 == 0, "Compressor must be a whole number of u64");
 _Static_assert(sizeof(igzip_train_state) % 8 == 0, "Trainer must be a whole number of u64");
 /* Goose stores the state as u64[...], which is 8-byte aligned. Neither C
