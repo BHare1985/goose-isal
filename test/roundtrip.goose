@@ -19,10 +19,8 @@ import support from "./support";
 // the 32 KiB history window, and the one-byte and empty cases.
 let SIZES = [0, 1, 7, 100, 1023, 4095, 4096, 65535, 65536, 65537, 131111];
 
-fn wrappers() -> igzip::Wrapper[3] {
-    var w: igzip::Wrapper[3] = [igzip::Wrapper.Raw, igzip::Wrapper.Gzip, igzip::Wrapper.Zlib];
-    return w;
-}
+let WRAPPERS: igzip::Wrapper[3] = [igzip::Wrapper.Raw, igzip::Wrapper.Gzip,
+                                   igzip::Wrapper.Zlib];
 
 fn compress_one_shot(body: const u8[:], wrap: igzip::Wrapper, level: i64) -> u8[>..] {
     var c = igzip::compressor(wrap, level as i32);
@@ -168,7 +166,7 @@ fn test_map() {
     var body: u8[>..] = [];
     support::corpus(body, 4000);
 
-    for wrap in wrappers() {
+    for wrap in WRAPPERS {
         for level in 4 {
             let one = compress_one_shot(body, wrap, level);
             let written = compress_written(body, wrap, level);
@@ -192,7 +190,7 @@ fn test_sizes() {
         var body: u8[>..] = [];
         support::body_of(body, n);
         assert(body.len == n);
-        for wrap in wrappers() {
+        for wrap in WRAPPERS {
             for level in 4 {
                 let stream = compress_one_shot(body, wrap, level);
                 decode_every_way(wrap, stream, body);
@@ -211,7 +209,7 @@ fn test_noise() {
     for n in [4096, 65536, 100003] {
         var body: u8[>..] = [];
         support::noise(body, n);
-        for wrap in wrappers() {
+        for wrap in WRAPPERS {
             for level in 4 {
                 let stream = compress_one_shot(body, wrap, level);
                 assert(stream.len > n || level == 0);
@@ -230,7 +228,7 @@ fn test_trained_tables() {
     assert(built == igzip::Status.Ok);
 
     // Through a Compressor.
-    for wrap in wrappers() {
+    for wrap in WRAPPERS {
         var c = igzip::compressor(wrap, 0);
         c.set_tables(tables);
         let stream, err = c.compressed(sample);
@@ -254,7 +252,7 @@ fn test_concatenated() {
     support::noise(b, 5000);
     var empty: u8[>..] = [];
 
-    for wrap in wrappers() {
+    for wrap in WRAPPERS {
         let sa = compress_one_shot(a, wrap, 1);
         let sb = compress_one_shot(b, wrap, 2);
         let se = compress_one_shot(empty, wrap, 1);
@@ -306,7 +304,7 @@ fn test_flush_points() {
     want.append(a);
     want.append(b);
 
-    for wrap in wrappers() {
+    for wrap in WRAPPERS {
         var w = igzip::writer(wrap, 1);
         var out: u8[>..] = [];
         assert(w.write(a, out) == igzip::Status.Ok);

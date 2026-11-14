@@ -14,6 +14,31 @@ import support from "./support";
 
 let READER_BYTES = 152936;
 
+// Drives one member through the shim's step function with a destination of
+// `cap` bytes. The shim stages the rest in the Reader's 64 KiB chunk and hands
+// it back on the next call, so this is the only place the staged-drain path is
+// exercised with a destination smaller than that chunk. The Reader is passed by
+// reference on purpose: a 152,936-byte value returned from a helper would be a
+// copy, and the copy guard refuses the very next call.
+fn read_tiny(r: igzip::Reader&, src: const u8[:], cap: i64) -> u8[>..] {
+    var out: u8[>..] = [];
+    var pos: i64     = 0;
+    var buf: u8[8]   = [0; 8];
+    loop {
+        var used:    u32 = 0;
+        var written: u32 = 0;
+        var done = false;
+        let rc = igzip::igzip_gs_reader_step(r, src[pos..], buf[..cap], used, written, done);
+        assert(rc == 0);
+        if written > 0 { out.append(buf[..written]); }
+        pos += used;
+        if done { break; }
+        if used == 0 && written == 0 { break; }
+    }
+    assert(pos == src.len);
+    return out;
+}
+
 fn gz_of(body: const u8[:]) -> u8[>..] {
     let out, err = igzip::gzip(body);
     assert(err == igzip::Status.Ok);
@@ -157,6 +182,48 @@ fn test_too_small(body: const u8[:]) {
     let u3, w3, e3 = r3.inflate(gz, exact);
     assert(e3 == igzip::Status.Ok && w3 == body.len);
     assert(support::same(exact, body));
+}
+
+fn test_tiny_destination(body: const u8[:]) {
+    let gz = gz_of(body);
+
+    // One byte of room at a time: everything but that byte waits in the Reader's
+    // chunk, and nothing may be lost or reordered on the way out.
+    var r = igzip::gzip_reader();
+    let one = read_tiny(r, gz, 1);
+    assert(support::same(one, body));
+    assert(r.finished());
+    assert(r.total_in == gz.len as u64);
+    assert(r.total_out == body.len as u64);
+    assert(r.finish() == igzip::Status.Ok);
+
+    // And eight at a time, which straddles every chunk boundary differently.
+    var r2 = igzip::gzip_reader();
+    let eight = read_tiny(r2, gz, 8);
+    assert(support::same(eight, body));
+    assert(r2.finish() == igzip::Status.Ok);
+}
+
+fn test_read_after_too_small(body: const u8[:]) {
+    let gz = gz_of(body);
+
+    // TooSmall leaves the Reader Fresh, and Fresh has to mean it: the decode
+    // state is mid-member, so switching to the streaming path afterwards must
+    // start from the beginning rather than continue a half-decoded member.
+    var r = igzip::gzip_reader();
+    var dst: u8[>..] = [];
+    dst.resize(body.len / 2, 0);
+    let u1, w1, e1 = r.inflate(gz, dst);
+    assert(e1 == igzip::Status.TooSmall);
+    assert(w1 == dst.len);
+
+    var out: u8[>..] = [];
+    let u2, e2 = r.read(gz, out);
+    assert(e2 == igzip::Status.Ok);
+    assert(u2 == gz.len);
+    assert(r.finished());
+    assert(support::same(out, body));
+    assert(r.finish() == igzip::Status.Ok);
 }
 
 fn test_trailing_bytes(body: const u8[:]) {
@@ -306,7 +373,6 @@ fn test_hostile_input() {
 
     // A gzip header claiming a compression method other than 8.
     var m: u8[>..] = [];
-    m.append(junk[..0]);
     m.push(0x1f);
     m.push(0x8b);
     m.push(7); // CM = LZMA, not deflate
@@ -478,6 +544,9 @@ fn test_set_dict_after_output(body: const u8[:]) {
     var dict: u8[>..] = [];
     support::body_of(dict, 100);
     assert(rz.set_dict(dict) == igzip::Status.BadState);
+    // An empty dictionary is a no-op where a dictionary is legal, and still a
+    // BadState where it is not: the moment is checked either way.
+    assert(rz.set_dict("") == igzip::Status.BadState);
 }
 
 fn test_copy_guard(body: const u8[:]) {
@@ -618,6 +687,8 @@ fn main() {
     test_empty_body();
     test_truncation(body);
     test_too_small(body);
+    test_read_after_too_small(body);
+    test_tiny_destination(body);
     test_trailing_bytes(body);
     test_concatenated(body);
     test_states(body);

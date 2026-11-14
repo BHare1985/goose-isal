@@ -619,12 +619,10 @@ fn reader_size() -> i64 {
 //
 // The call ends when `src` is exhausted or a member ends. `finished(r)` is true
 // only in the second case, and at that point every decoded byte is already in
-// `out`. Two idioms follow from that:
-//
-//   let used, err = r.read(gz, body);        // one member, then a boundary
-//
-//   // Drain when the destination, not the input, ran out.
-//   let used, err = r.read("", body);
+// `out`: this loops until igzip has nothing left to give, so it never returns
+// holding staged output. An empty `src` is therefore legal and a no-op; it is
+// kept because `igzip_gs_reader_step` needs exactly that call to drain a
+// destination smaller than the chunk, and the two spellings should not disagree.
 //
 // Input beyond `MAX_INPUT` is split into windows, never rejected.
 fn read(r: Reader&, src: const u8[:], out: u8[>..]&) -> i64, Status {
@@ -637,8 +635,8 @@ fn read(r: Reader&, src: const u8[:], out: u8[>..]&) -> i64, Status {
 fn read_windowed(r: Reader&, src: const u8[:], out: u8[>..]&, step: i64) -> i64, Status {
     guard step > 0 && step <= MAX_INPUT else { return 0, Status.Overflow; }
     guard r.state != ReaderState.Finished else { return 0, Status.BadState; }
-    // An empty source is legal: it is how output igzip staged is drained when
-    // the destination, not the input, was the thing that ran out.
+    // An empty source is legal: it is the drain call for a step-level caller
+    // whose destination was smaller than the chunk, and a no-op otherwise.
     if src.len == 0 { return read_window(r, "", out); }
 
     var pos: i64 = 0;
@@ -690,7 +688,9 @@ fn finished(r: Reader&) -> bool {
 // because `read` cannot return at a member boundary holding bytes back, so
 // there is nothing to drain.
 //
-// A reader cannot be read from after this; `reset` starts the next member.
+// A reader cannot be read from after this, and `reset` starts the next member.
+// A terminal error closes the body too, so `finish` after `Corrupt` is
+// `BadState` rather than a second verdict on a stream that is already dead.
 fn finish(r: Reader&) -> Status {
     guard r.state != ReaderState.Finished else { return Status.BadState; }
     let done = finished(r);

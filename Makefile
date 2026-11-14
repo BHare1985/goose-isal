@@ -5,13 +5,17 @@
 # cmake, nasm (ISA-L's x86-64 kernels) and a C compiler.
 #
 # The Goose compiler comes from $GOOSE when set, otherwise from PATH, otherwise
-# from the first unpacked release under ~/.goose/toolchain.
+# from the first unpacked release under $GOOSE_HOME/toolchain.
 SHELL := /bin/bash
+
+# Where the Goose toolchain and its package build tree live. `goose toolchain`
+# reports it; setting GOOSE_HOME moves both.
+GOOSE_HOME ?= $(HOME)/.goose
 
 ifeq ($(origin GOOSE),undefined)
 GOOSE := $(shell command -v goose 2>/dev/null)
 ifeq ($(GOOSE),)
-GOOSE := $(firstword $(wildcard $(HOME)/.goose/toolchain/goose-*/goose))
+GOOSE := $(firstword $(wildcard $(GOOSE_HOME)/toolchain/goose-*/goose))
 endif
 endif
 
@@ -94,7 +98,7 @@ examples: check
 # the ISA-L version should be followed by this.
 stress:
 	@mkdir -p build
-	@lib=$$(find $(HOME)/.goose/build/pkg -path '*/cmake/pkg/vendor/isa-l/libisal.a' 2>/dev/null | head -1); \
+	@lib=$$(find $(GOOSE_HOME)/build/pkg -path '*/cmake/pkg/vendor/isa-l/libisal.a' 2>/dev/null | head -1); \
 	if [ -z "$$lib" ]; then echo "build the package first: make test"; exit 1; fi; \
 	for src in bound_stress read_stress; do \
 		echo "== scripts/$$src.c"; \

@@ -103,7 +103,10 @@ Each of these was measured, not assumed.
     can be held back at a member boundary and `finish` needs no output buffer.
     The case that *does* leave bytes staged is the caller's destination filling
     up, and `isal_inflate` with `avail_in == 0` copies them out on the next call
-    (measured: 4,053 bytes in one call) — that is `read(r, "", out)`.
+    (measured: 4,053 bytes in one call). `read` never gets there — its
+    destination is the whole 64 KiB chunk and it loops until nothing is left —
+    so the empty-source drain matters to a caller driving
+    `igzip_gs_reader_step` directly, and is a documented no-op otherwise.
 12. **The two families collide on return codes.** Inflate uses `-1` for
     `ISAL_INVALID_BLOCK` and `-3` for `ISAL_INVALID_LOOKBACK`, which the deflate
     status table reads as `STATELESS_OVERFLOW` and `ISAL_INVALID_STATE`. Worse,

@@ -201,7 +201,7 @@ fn main() {
         assert(w.reset() == igzip::Status.Ok);
         assert(member.len <= BOX);
         var box = RoundBox { records: records as i32, len: member.len as i32, .. };
-        for j in member.len { box.data[j] = member[j]; }
+        box.data[..member.len].move_from(member[..]);
         qput(box);
     }
     qput(RoundBox { len: -1, .. });

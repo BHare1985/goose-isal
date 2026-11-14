@@ -15,7 +15,9 @@
  * single byte past either end is a failure rather than a silent corruption.
  * Output buffers run from 1 byte to 64 KiB, every truncation offset is decoded,
  * and a few hundred mutations are decoded too, because untrusted input is the
- * whole reason a reader exists.
+ * whole reason a reader exists. Both level 0 (stored and static-Huffman blocks)
+ * and level 1 (dynamic-Huffman block headers) are decoded: they are different
+ * decode paths, not the same one with different tables.
  *
  *     make stress
  *
@@ -77,33 +79,36 @@ static void make_plain(void) {
 		plain[i] = ((i / 4096) % 2 == 0) ? (uint8_t)rec[i % rec_len] : nextb();
 }
 
-static void make_stream(int wrap) {
+/* Level 0 and level 1 do not decode through the same code: level 0 emits stored
+ * and static-Huffman blocks, level 1 emits dynamic-Huffman block headers. Both
+ * are decoded here, so the ASan checks cover the block kinds a caller will see
+ * in practice. */
+static void make_stream(int wrap, int level) {
 	uint8_t *lvb = malloc(ISAL_DEF_LVL3_MEDIUM);
 	size_t cap = (size_t)gs_bound(N);
-	comp = malloc(cap);
+	if (!comp) comp = malloc(cap);
 
-	for (int level = 0; level <= 3; level++) {
-		struct isal_zstream zs;
-		isal_deflate_stateless_init(&zs);
-		zs.next_in = plain;
-		zs.avail_in = N;
-		zs.next_out = comp;
-		zs.avail_out = (uint32_t)cap;
-		zs.end_of_stream = 1;
-		zs.level = (uint32_t)level;
-		zs.gzip_flag = (uint16_t)wrapper_code(wrap);
-		if (level) {
-			zs.level_buf = lvb;
-			zs.level_buf_size = ISAL_DEF_LVL3_MEDIUM;
-		}
-		if (isal_deflate_stateless(&zs) != COMP_OK) {
-			fprintf(stderr, "deflate failed (wrap %d level %d)\n", wrap, level);
-			exit(2);
-		}
-		clen = cap - zs.avail_out;
-		/* Every level decodes to the same bytes; one stream is enough to
-		 * exercise the decode paths. */
-		break;
+	struct isal_zstream zs;
+	isal_deflate_stateless_init(&zs);
+	zs.next_in = plain;
+	zs.avail_in = N;
+	zs.next_out = comp;
+	zs.avail_out = (uint32_t)cap;
+	zs.end_of_stream = 1;
+	zs.level = (uint32_t)level;
+	zs.gzip_flag = (uint16_t)wrapper_code(wrap);
+	if (level) {
+		zs.level_buf = lvb;
+		zs.level_buf_size = ISAL_DEF_LVL3_MEDIUM;
+	}
+	if (isal_deflate_stateless(&zs) != COMP_OK) {
+		fprintf(stderr, "deflate failed (wrap %d level %d)\n", wrap, level);
+		exit(2);
+	}
+	clen = cap - zs.avail_out;
+	if (clen == 0 || clen > cap) {
+		fprintf(stderr, "deflate produced no stream (wrap %d level %d)\n", wrap, level);
+		exit(2);
 	}
 	free(lvb);
 }
@@ -324,25 +329,30 @@ static void check_dictionary(void) {
 int main(void) {
 	make_plain();
 	static const size_t caps[] = {1, 2, 3, 8, 64, 4096, CHUNK};
+	/* Stored/static blocks and dynamic blocks, for every wrapper. */
+	static const int levels[] = {0, 1};
 
 	for (int wrap = 0; wrap < 3; wrap++) {
-		make_stream(wrap);
-		for (size_t k = 0; k < sizeof caps / sizeof caps[0]; k++)
-			check_streaming(wrap, caps[k]);
-		check_streaming(wrap, CHUNK);
-		check_stateless(wrap);
-		check_truncations(wrap);
-		free(comp);
+		for (size_t l = 0; l < sizeof levels / sizeof levels[0]; l++) {
+			make_stream(wrap, levels[l]);
+			for (size_t k = 0; k < sizeof caps / sizeof caps[0]; k++)
+				check_streaming(wrap, caps[k]);
+			check_stateless(wrap);
+			check_truncations(wrap);
+		}
 	}
 
 	/* Mutations use the gzip stream: a wrapper is the interesting case, and a
-	 * bare deflate stream is the case where nothing can catch them. */
-	make_stream(1);
-	check_mutations(1);
-	check_mutations(0);
-	free(comp);
+	 * bare deflate stream is the case where nothing can catch them. Both block
+	 * kinds, because a corruption inside a stored block reads very differently
+	 * from one inside a Huffman code. */
+	for (size_t l = 0; l < sizeof levels / sizeof levels[0]; l++) {
+		make_stream(1, levels[l]);
+		check_mutations(1);
+		check_mutations(0);
+	}
 
-	make_stream(2);
+	make_stream(2, 1);
 	check_dictionary();
 	free(comp);
 
