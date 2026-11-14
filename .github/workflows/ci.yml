@@ -133,18 +133,17 @@ jobs:
       # build is asserted; the run is reported as a warning rather than an
       # ##[error], because a tolerated failure that prints an error annotation
       # reads as a red job in the log and in the pull request.
-      - name: threads (native, Windows — build asserted, run reported)
+      # Windows builds the threaded program and is expected to run it: the
+      # reader worker's mismatch was never the codec or the queue (igzip verified
+      # the gzip CRC of every member it decoded), so there is nothing to tolerate.
+      # A failing run is a failing job, with its diagnostics in the log.
+      - name: threads (native, Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
           set -euo pipefail
           goose build test/threads.goose -o "$RUNNER_TEMP/threads.exe"
-          # The run's own output goes to the log in full: its mismatch line is
-          # the whole point of this step while the difference is open, and a
-          # warning annotation would truncate it.
-          if ! "$RUNNER_TEMP/threads.exe"; then
-            echo "::warning title=threads on Windows::the reader worker decoded the wrong bytes; its diagnostics are above"
-          fi
+          "$RUNNER_TEMP/threads.exe"
 
       - name: 4.2 GiB round trip (native)
         if: runner.os != 'Windows'

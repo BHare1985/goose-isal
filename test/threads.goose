@@ -176,6 +176,7 @@ thread_fn reader_worker() {
                   " body.sum=", checksum(body), " body2.sum=", checksum(body2));
             show_around("  out", out, at);
             show_around("  body", body, at);
+            show_diffs(out, body, 8);
             code = 3;
         } else if !holder[0].finish() {
             code = 4;
@@ -197,6 +198,28 @@ fn checksum(xs: const u8[:]) -> i64 {
     var h: i64 = 0;
     for x in xs { h = (h * 31 + x) % 1000000007; }
     return h;
+}
+
+// Up to `limit` disagreements as offset:out/body, with how many there are in
+// total: one block, one per record, and a shift look different here.
+fn show_diffs(out: const u8[:], body: const u8[:], limit: i64) {
+    var line: u8[>..] = [];
+    format(line, "  diffs:");
+    var total: i64 = 0;
+    var shown: i64 = 0;
+    var k:     i64 = 0;
+    while k < out.len && k < body.len {
+        if out[k] != body[k] {
+            total++;
+            if shown < limit {
+                format(line, " ", k, ":", out[k] as i64, "/", body[k] as i64);
+                shown++;
+            }
+        }
+        k++;
+    }
+    format(line, " (", total, " total)");
+    print(line);
 }
 
 // A log with no hexdump, for the bytes either side of the first difference.
@@ -242,21 +265,30 @@ fn main() {
 
     // Members compressed on this thread, to be decoded by a worker thread.
     var w = igzip::gzip_writer(1);
-    var member: u8[>..] = [];
-    var body:   u8[>..] = [];
+    var member:  u8[>..] = [];
+    var body:    u8[>..] = [];
+    var scratch: u8[>..] = [];
     for i in ROUND_JOBS {
         let records = 100 + i * 75;
         body.clear();
         make_body(body, records as i32);
+        let gen = checksum(body);
+        // A second generation and a checksum after the write bracket the two
+        // things that can touch this buffer: make_body, and the Writer.
+        scratch.clear();
+        make_body(scratch, records as i32);
+        let gen2 = checksum(scratch);
         member.clear();
         assert(w.write(body, member));
         assert(w.finish(member));
         assert(w.reset());
+        let post = checksum(body);
+        print("main body ", records, ": gen=", gen, " gen2=", gen2, " post=", post);
         assert(member.len <= BOX);
         var box = RoundBox {
             records: records as i32,
             len:     member.len as i32,
-            sum:     checksum(body),
+            sum:     gen,
             ..
         };
         box.data[..member.len].move_from(member[..]);
@@ -310,15 +342,25 @@ fn main() {
     }
     guard stream_shared_seen == 2 else { abort("the shared streaming job did not come back twice"); };
 
-    // Members compressed here, decoded on another thread, byte for byte.
+    // Members compressed here, decoded on another thread, byte for byte. Every
+    // result is collected before deciding, so one run reports every failing
+    // member rather than the first one to arrive.
     var rounds_seen = 0;
+    var round_failures = 0;
+    var first_failure: i32 = 0;
     for i in ROUND_JOBS {
         let r = qget<RoundResult>();
-        guard r.code == 0 else { abort(str("reader worker failed (code ", r.code, ")")); };
-        guard r.matched else { abort("reader worker decoded the wrong bytes"); };
+        if r.code != 0 || !r.matched {
+            round_failures++;
+            if first_failure == 0 { first_failure = r.code; }
+        }
         rounds_seen++;
     }
     guard rounds_seen == ROUND_JOBS else { abort("a round trip went missing"); };
+    guard round_failures == 0 else {
+        abort(str("reader worker failed (code ", first_failure, ") on ", round_failures,
+                  " of ", ROUND_JOBS, " members"));
+    };
 
     for id in ids { thread_wait(id); }
     for id in stream_ids { thread_wait(id); }

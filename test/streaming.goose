@@ -85,18 +85,20 @@ fn test_equivalence() {
     }
 }
 
+// Chunking is an input-delivery detail, not a stream format: how much of the
+// body arrives per `write` call is allowed to move ISA-L's internal block
+// boundaries, and the aarch64 kernels do. Every spelling is valid deflate, so
+// the assertion is the one a caller depends on -- the decoded bytes.
 fn test_chunked() {
     var body: u8[>..] = [];
     support::body_of(body, 120233);
-    let one = streamed(body, igzip::Wrapper.Gzip, 1);
     let chunks: i64[5] = [1, 7, 63, 4096, 70000];
     let many = streamed_chunks(body, chunks);
-    assert(one.len == many.len);
-    assert(support::same(one, many));
+    decodes("chunked", many, body);
 
     let tiny: i64[1] = [13];
     let slow = streamed_chunks(body, tiny);
-    assert(one.len == slow.len && support::same(one, slow));
+    decodes("chunked-13", slow, body);
 }
 
 fn test_flush() {
@@ -198,19 +200,24 @@ fn test_windows() {
     var body: u8[>..] = [];
     support::body_of(body, 1048576);
 
+    let direct = streamed(body, igzip::Wrapper.Gzip, 1);
+
+    // A window boundary is a chunk boundary by another name, so the same rule
+    // as test_chunked applies: decode it, do not compare block boundaries.
     var w = igzip::gzip_writer(1);
     var out: u8[>..] = [];
     assert(w.write_windowed(body, out, 65536));
     assert(w.finish(out));
-    let direct = streamed(body, igzip::Wrapper.Gzip, 1);
-    assert(out.len == direct.len && support::same(out, direct));
+    decodes("windowed-64k", out, body);
 
     var w2 = igzip::gzip_writer(1);
     var o2: u8[>..] = [];
     assert(w2.write_windowed(body, o2, 1));
     assert(w2.finish(o2));
-    assert(support::same(o2, direct));
+    decodes("windowed-1", o2, body);
 
+    // One window is one write, so this spelling is byte-identical by
+    // construction and can still be compared directly.
     var wlarge = igzip::gzip_writer(1);
     var olarge: u8[>..] = [];
     assert(wlarge.write_windowed(body, olarge, igzip::MAX_INPUT));
@@ -253,6 +260,17 @@ fn write_artifacts(body: const u8[:]) {
     // checks it rather than asserting byte identity.
     let slow = streamed(body, igzip::Wrapper.Gzip, 0);
     assert(write_file(str(TMP, "/level0.gz"), slow));
+}
+
+// A gzip artifact's real contract: it decodes to the body it was written from.
+// Assertion messages name the artifact, so a failure says which stream is wrong.
+fn decodes(what: const u8[:], stream: const u8[:], want: const u8[:]) {
+    var r = igzip::gzip_reader();
+    let out, err = r.inflated(stream);
+    guard err else { abort(str("streaming artifact ", what, " does not decode")); };
+    guard support::same(out, want) else {
+        abort(str("streaming artifact ", what, " decodes to the wrong bytes"));
+    };
 }
 
 // The reason the last failing call gave, compared with a variant. Five lines
