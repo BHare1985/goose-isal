@@ -27,7 +27,7 @@ behaviours the API encodes, the security notes, and the FFI review gates — is 
 | `docs/guide.md` | How to use the package, with the reasoning |
 | `docs/coverage.md` | `igzip_lib.h` surface → this package, plus what is left out and why |
 | `docs/verification.md` | What `make verify` proves, file by file |
-| `docs/internals.md`, `docs/design/` | Maintainer invariants and the design briefs |
+| `docs/internals.md` | Maintainer invariants: the pin, the memory model, the behaviours the API encodes, the FFI gates |
 
 ## Commands
 

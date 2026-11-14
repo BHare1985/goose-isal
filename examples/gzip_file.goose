@@ -15,6 +15,13 @@ import std;
 import os;
 import igzip from "..";
 
+// The reason the last failing call gave, compared with a variant. Five lines
+// rather than a whole assertion shape at 40 call sites: with a bool return the
+// detail is out of band, in igzip::status().
+fn failed_as(want: igzip::Status) -> bool {
+    return igzip::status() == want;
+}
+
 fn main() {
     let argv = args();
     guard argv.len > 1 else {
@@ -34,8 +41,8 @@ fn main() {
     }
 
     let gz, err = igzip::gzip(body, level);
-    guard err.ok() else {
-        abort(str("compress failed: ", igzip::status_name(err)));
+    guard err else {
+        abort(str("compress failed: ", igzip::error()));
     }
 
     let path = str(argv[1], ".gz");
@@ -44,7 +51,7 @@ fn main() {
     // Read it back: a complete member that decodes to what went in.
     var r = igzip::gzip_reader();
     let back, derr = r.inflated(gz);
-    guard derr.ok() else { abort(str("verify failed: ", igzip::status_name(derr))); };
+    guard derr else { abort(str("verify failed: ", igzip::error())); };
     guard back == body else { abort("verify failed: the file does not round trip"); };
 
     print(path, ": ", body.len, " -> ", gz.len, " bytes");

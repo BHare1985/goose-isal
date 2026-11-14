@@ -1,8 +1,14 @@
 # goose-igzip
 
+[![ci](https://github.com/BHare1985/goose-igzip/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/BHare1985/goose-igzip/actions/workflows/ci.yml)
+
 A complete gzip, zlib and raw-deflate codec in [Goose](https://goose-lang.org),
 bound to Intel ISA-L's **igzip**: compress and decompress, streaming or one-shot,
 with trained Huffman tables, custom headers and preset dictionaries.
+
+The current version is **0.4.0**. CI typechecks the package, runs every test, and
+independently decodes the streams it wrote, on all four platforms Goose ships a
+compiler for: linux-x64, macos-x64, macos-arm64 and windows-x64.
 
 Everything a caller touches is a Goose value, so the owning scope is the free —
 no C memory to release and no handle to close. Failures are a typed `Status`, and
@@ -15,8 +21,8 @@ import igzip;
 
 fn main() {
     var c = igzip::gzip_compressor(1);          // keep one per thread
-    let gz, err = c.compressed(body);           // fresh buffer in your destination
-    guard err.ok() else { abort(igzip::status_name(err)); };
+    let gz, ok = c.compressed(body);            // fresh buffer in your destination
+    guard ok else { abort(str("compress failed: ", igzip::error())); };
 }
 ```
 
@@ -55,11 +61,11 @@ c.compress(body_b, out);
 var w = igzip::gzip_writer(1);
 var out: u8[>..] = [];
 
-guard w.write(chunk_a, out).ok() else { abort("write failed"); };
-guard w.flush(out).ok() else { abort("flush failed"); };      // a decode point
-guard w.write(chunk_b, out).ok() else { abort("write failed"); };
-guard w.finish(out).ok() else { abort("finish failed"); };     // the trailer
-guard w.reset().ok() else { abort("reset failed"); };          // next body
+guard w.write(chunk_a, out) else { abort("write failed"); };
+guard w.flush(out) else { abort("flush failed"); };      // a decode point
+guard w.write(chunk_b, out) else { abort("write failed"); };
+guard w.finish(out) else { abort("finish failed"); };     // the trailer
+guard w.reset() else { abort("reset failed"); };          // next body
 ```
 
 **Decompress.** `read` appends decoded bytes and tells you how much of your input
@@ -69,10 +75,11 @@ it used, because a decoder stops at the end of a member.
 var r = igzip::gzip_reader();
 var body: u8[>..] = [];
 
-let used, err = r.read(gz, body);
-guard err.ok() else { abort(igzip::status_name(err)); };
+let used, ok = r.read(gz, body);
+guard ok else { abort(str("read failed: ", igzip::error())); };
+
 guard r.finished() else { abort("feed me more"); };   // member not complete yet
-guard r.finish().ok() else { abort("truncated"); };   // Ok, or Truncated
+guard r.finish() else { abort("truncated"); };               // false means truncated
 
 // gz[used..] is the next member, or trailing bytes that are not this one.
 ```
@@ -98,7 +105,7 @@ t.add(json_body);
 guard t.symbols() >= 64 * 1024 else { /* keep warming */ };
 
 let tables, built = t.build();
-guard built.ok() else { abort(igzip::status_name(built)); };
+guard built else { abort(str("training failed: ", igzip::error())); };
 c.set_tables(tables);                  // level 0 from here on
 ```
 
@@ -207,15 +214,30 @@ is `igzip::compress(c, ..)`. Full detail, with the reasoning, is in
 | Call | Meaning |
 |---|---|
 | `version(out)` | ISA-L release, read from its headers |
-| `bound(n)` | upper bound on compressed size, for sizing a destination |
+| `bound(n)` | upper bound on compressed size, for sizing a destination; `0` when there is none |
 | `compressor_size()`, `writer_size()`, `reader_size()`, `trainer_size()` | the pinned value sizes |
 | `MAX_INPUT`, `MAX_IN_STEP`, `MAX_HEADER` | the 32-bit input limit, the window size, the header cap |
 
-`Status` is `Ok`, twelve named failures and `Other`; `status_name` renders them
-and nothing aborts on bad input. A `Status` is not a condition in Goose, so the
-common form is `guard err.ok() else { ... }` and a specific case is
-`err == igzip::Status.BadTable`. The full list is in
-[docs/guide.md](docs/guide.md#errors).
+Every call that can fail returns a `bool` — with the data in front of it, as in
+`let used, ok = r.read(..)` — and nothing aborts on bad input. Why it failed is
+`igzip::error()` for text, or `igzip::status()` for the `Status` to branch on:
+the two accessors `goose_gfx` uses, recorded per thread so a worker's failure is
+its own.
+
+```goose
+guard w.finish(out) else { abort(str("finish failed: ", igzip::error())); };
+
+let used, ok = r.read(gz, body);
+guard ok else {
+    match igzip::status() {
+        Truncated => { /* feed more */ },
+        Corrupt => { /* drop it */ },
+        _ => { /* anything else */ },
+    }
+};
+```
+
+The full list of statuses is in [docs/guide.md](docs/guide.md#errors).
 
 ## Untrusted input
 
@@ -234,7 +256,7 @@ produce. What that means here:
   when `r.total_out` passes your own cap.
 - **A wrong dictionary is only caught if there is a trailer.** On gzip and zlib
   it is `BadChecksum` at the end; on raw there is no trailer and nothing catches
-  it — wrong bytes with `Status.Ok`.
+  it — wrong bytes and no error.
 - **Header CRCs are reported, not verified.** `read_gzip_header` says whether an
   FHCRC is present; `isal_inflate` steps over it too, so neither call rejects a
   header on its CRC. Every *length* in a header is checked against the bytes
@@ -254,7 +276,6 @@ that allocate every buffer to its exact size.
 | [docs/coverage.md](docs/coverage.md) | what `igzip` exposes and what this package does with it — including what is deliberately left out |
 | [docs/verification.md](docs/verification.md) | what `make verify` proves, file by file |
 | [docs/internals.md](docs/internals.md) | maintaining it: the pin, the memory model, the igzip behaviours the API encodes, the FFI gates |
-| [docs/design/](docs/design/) | the design briefs, with the measurements behind each decision |
 | [ROADMAP.md](ROADMAP.md) · [CHANGELOG.md](CHANGELOG.md) | where it is going, and what each release added |
 
 ## Examples
@@ -297,11 +318,11 @@ File-by-file detail, and the ISA-L quirks that shape the results, are in
 ## Importing
 
 ```goose
-import igzip from "BHare1985/goose-igzip@v0.3.0";
+import igzip from "BHare1985/goose-igzip@v0.4.0";
 ```
 
-Goose fetches the repo and its submodule. Until a tag exists, use a commit or a
-local path.
+Goose fetches the repo and its submodule. Before the 0.4.0 tag exists, use a
+commit or a local path.
 
 ## Acknowledgements
 

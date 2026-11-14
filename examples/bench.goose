@@ -101,10 +101,17 @@ fn run(c: igzip::Compressor&, arena: u8[>..]&, at: i64[>..]&, out: u8[>..]&) -> 
         out.clear();
         let body = arena[at[TRAIN + i]..at[TRAIN + i + 1]];
         let err = c.compress(body, out);
-        if !err.ok() { abort(igzip::status_name(err)); }
+        if !err { abort(str("compress failed: ", igzip::error())); }
         compressed += out.len;
     }
     return compressed, clock_ns() - start;
+}
+
+// The reason the last failing call gave, compared with a variant. Five lines
+// rather than a whole assertion shape at 40 call sites: with a bool return the
+// detail is out of band, in igzip::status().
+fn failed_as(want: igzip::Status) -> bool {
+    return igzip::status() == want;
 }
 
 fn main() {
@@ -121,10 +128,10 @@ fn main() {
         var trainer = igzip::trainer();
         for i in TRAIN {
             let err = trainer.add(arena[at[i]..at[i + 1]]);
-            if !err.ok() { abort(igzip::status_name(err)); }
+            if !err { abort(str("compress failed: ", igzip::error())); }
         }
         let tables, built = trainer.build();
-        if !built.ok() { abort(igzip::status_name(built)); }
+        if !built { abort(igzip::error()); }
 
         let size = at[1] - at[0];
         let original = size * MEASURED;

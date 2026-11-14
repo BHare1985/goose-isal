@@ -25,15 +25,15 @@ let WRAPPERS: igzip::Wrapper[3] = [igzip::Wrapper.Raw, igzip::Wrapper.Gzip,
 fn compress_one_shot(body: const u8[:], wrap: igzip::Wrapper, level: i64) -> u8[>..] {
     var c = igzip::compressor(wrap, level as i32);
     let out, err = c.compressed(body);
-    assert(err == igzip::Status.Ok);
+    assert(err);
     return out;
 }
 
 fn compress_written(body: const u8[:], wrap: igzip::Wrapper, level: i64) -> u8[>..] {
     var w = igzip::writer(wrap, level as i32);
     var out: u8[>..] = [];
-    assert(w.write(body, out) == igzip::Status.Ok);
-    assert(w.finish(out) == igzip::Status.Ok);
+    assert(w.write(body, out));
+    assert(w.finish(out));
     assert(w.total_in == body.len as u64);
     return out;
 }
@@ -48,12 +48,12 @@ fn compress_chunked(body: const u8[:], wrap: igzip::Wrapper, level: i64) -> u8[>
     while pos < body.len {
         var n = step;
         if n > body.len - pos { n = body.len - pos; }
-        assert(w.write(body[pos..pos + n], out) == igzip::Status.Ok);
+        assert(w.write(body[pos..pos + n], out));
         pos += n;
         step = step * 3 + 1;
         if step > 4096 { step = 1; }
     }
-    assert(w.finish(out) == igzip::Status.Ok);
+    assert(w.finish(out));
     assert(w.total_in == body.len as u64);
     return out;
 }
@@ -63,10 +63,10 @@ fn read_whole(wrap: igzip::Wrapper, stream: const u8[:], want: const u8[:]) {
     var r = igzip::reader(wrap);
     var out: u8[>..] = [];
     let used, err = r.read(stream, out);
-    assert(err == igzip::Status.Ok);
+    assert(err);
     assert(used == stream.len);
     assert(r.finished());
-    assert(r.finish() == igzip::Status.Ok);
+    assert(r.finish());
     assert(r.total_in == stream.len as u64);
     assert(r.total_out == want.len as u64);
     assert(support::same(out, want));
@@ -81,7 +81,7 @@ fn read_chunked(wrap: igzip::Wrapper, stream: const u8[:], want: const u8[:], st
         var n = step;
         if n > stream.len - pos { n = stream.len - pos; }
         let used, err = r.read(stream[pos..pos + n], out);
-        assert(err == igzip::Status.Ok);
+        assert(err);
         pos += used;
         // A window may end before the bytes it was given were taken: the reader
         // stops at a member boundary and nowhere else.
@@ -91,7 +91,7 @@ fn read_chunked(wrap: igzip::Wrapper, stream: const u8[:], want: const u8[:], st
     }
     assert(pos == stream.len);
     assert(r.finished());
-    assert(r.finish() == igzip::Status.Ok);
+    assert(r.finish());
     assert(support::same(out, want));
 }
 
@@ -99,7 +99,7 @@ fn read_windowed_at(wrap: igzip::Wrapper, stream: const u8[:], want: const u8[:]
     var r = igzip::reader(wrap);
     var out: u8[>..] = [];
     let used, err = r.read_windowed(stream, out, step);
-    assert(err == igzip::Status.Ok);
+    assert(err);
     assert(used == stream.len);
     assert(r.finished());
     assert(support::same(out, want));
@@ -111,7 +111,7 @@ fn read_stateless(wrap: igzip::Wrapper, stream: const u8[:], want: const u8[:]) 
     var dst: u8[>..] = [];
     dst.resize(want.len, 0);
     let used, written, err = r.inflate(stream, dst);
-    assert(err == igzip::Status.Ok);
+    assert(err);
     assert(used == stream.len);
     assert(written == want.len);
     assert(support::same(dst, want));
@@ -125,7 +125,7 @@ fn read_stateless_retry(wrap: igzip::Wrapper, stream: const u8[:], want: const u
         var dst: u8[>..] = [];
         dst.resize(cap, 0);
         let used, written, err = r.inflate(stream, dst);
-        if err == igzip::Status.TooSmall {
+        if failed_as(igzip::Status.TooSmall) {
             // The claim behind TooSmall: the destination really was too small,
             // it was filled exactly, and the reader is ready to try again.
             assert(cap < want.len);
@@ -134,7 +134,7 @@ fn read_stateless_retry(wrap: igzip::Wrapper, stream: const u8[:], want: const u
             cap = cap * 2 + 16;
             continue;
         }
-        assert(err == igzip::Status.Ok);
+        assert(err);
         assert(written == want.len);
         assert(support::same(dst[..written], want));
         return;
@@ -144,7 +144,7 @@ fn read_stateless_retry(wrap: igzip::Wrapper, stream: const u8[:], want: const u
 fn read_inflated(wrap: igzip::Wrapper, stream: const u8[:], want: const u8[:]) {
     var r = igzip::reader(wrap);
     let out, err = r.inflated(stream);
-    assert(err == igzip::Status.Ok);
+    assert(err);
     assert(support::same(out, want));
 }
 
@@ -223,25 +223,25 @@ fn test_trained_tables() {
     var sample: u8[>..] = [];
     support::corpus(sample, 3000);
     var t = igzip::trainer();
-    assert(t.add(sample) == igzip::Status.Ok);
+    assert(t.add(sample));
     let tables, built = t.build();
-    assert(built == igzip::Status.Ok);
+    assert(built);
 
     // Through a Compressor.
     for wrap in WRAPPERS {
         var c = igzip::compressor(wrap, 0);
         c.set_tables(tables);
         let stream, err = c.compressed(sample);
-        assert(err == igzip::Status.Ok);
+        assert(err);
         decode_every_way(wrap, stream, sample);
     }
 
     // And through a Writer.
     var w = igzip::gzip_writer(1);
     var out: u8[>..] = [];
-    assert(w.set_tables(tables) == igzip::Status.Ok);
-    assert(w.write(sample, out) == igzip::Status.Ok);
-    assert(w.finish(out) == igzip::Status.Ok);
+    assert(w.set_tables(tables));
+    assert(w.write(sample, out));
+    assert(w.finish(out));
     decode_every_way(igzip::Wrapper.Gzip, out, sample);
 }
 
@@ -269,7 +269,7 @@ fn test_concatenated() {
         // Automatic: all three, joined, the empty member contributing nothing.
         var r = igzip::reader(wrap);
         let out, err = r.inflated(joined);
-        assert(err == igzip::Status.Ok);
+        assert(err);
         assert(support::same(out, want));
 
         // Explicit: one member per read, reset between.
@@ -279,17 +279,17 @@ fn test_concatenated() {
         var members = 0;
         loop {
             let used, e = r2.read(joined[pos..], acc);
-            assert(e == igzip::Status.Ok);
+            assert(e);
             pos += used;
             members++;
             if !r2.finished() { break; }
             if pos == joined.len { break; }
-            assert(r2.reset() == igzip::Status.Ok);
+            assert(r2.reset());
         }
         assert(members == 3);
         assert(pos == joined.len);
         assert(support::same(acc, want));
-        assert(r2.finish() == igzip::Status.Ok);
+        assert(r2.finish());
     }
 }
 
@@ -307,46 +307,55 @@ fn test_flush_points() {
     for wrap in WRAPPERS {
         var w = igzip::writer(wrap, 1);
         var out: u8[>..] = [];
-        assert(w.write(a, out) == igzip::Status.Ok);
-        assert(w.flush(igzip::Flush.Sync, out) == igzip::Status.Ok);
+        assert(w.write(a, out));
+        assert(w.flush(igzip::Flush.Sync, out));
         let at_flush = out.len;
-        assert(w.write(b, out) == igzip::Status.Ok);
-        assert(w.finish(out) == igzip::Status.Ok);
+        assert(w.write(b, out));
+        assert(w.finish(out));
 
         // The prefix decodes entirely, and is not a complete member.
         var r = igzip::reader(wrap);
         let prefix, e1 = r.inflated(out[..at_flush]);
-        assert(e1 == igzip::Status.Truncated);
+        assert(!e1);
+        assert(failed_as(igzip::Status.Truncated));
         assert(support::same(prefix, a));
 
         // Nothing after the flush point is needed to get every byte of `a`.
         var r2 = igzip::reader(wrap);
         var parts: u8[>..] = [];
         let u2, e2 = r2.read(out[..at_flush], parts);
-        assert(e2 == igzip::Status.Ok);
+        assert(e2);
         assert(u2 == at_flush);
         assert(!r2.finished());
         assert(support::same(parts, a));
-        assert(r2.finish() == igzip::Status.Truncated);
+        assert(!r2.finish());
+        assert(failed_as(igzip::Status.Truncated));
 
         // Resuming from the flush point gives the rest, and the whole stream
         // decodes as one member.
         var r3 = igzip::reader(wrap);
         var acc: u8[>..] = [];
         let u3, e3 = r3.read(out[..at_flush], acc);
-        assert(e3 == igzip::Status.Ok && u3 == at_flush);
+        assert(e3 == true && u3 == at_flush);
         let u4, e4 = r3.read(out[at_flush..], acc);
-        assert(e4 == igzip::Status.Ok);
+        assert(e4);
         assert(u4 == out.len - at_flush);
         assert(r3.finished());
-        assert(r3.finish() == igzip::Status.Ok);
+        assert(r3.finish());
         assert(support::same(acc, want));
 
         var r4 = igzip::reader(wrap);
         let whole, e5 = r4.inflated(out);
-        assert(e5 == igzip::Status.Ok);
+        assert(e5);
         assert(support::same(whole, want));
     }
+}
+
+// The reason the last failing call gave, compared with a variant. Five lines
+// rather than a whole assertion shape at 40 call sites: with a bool return the
+// detail is out of band, in igzip::status().
+fn failed_as(want: igzip::Status) -> bool {
+    return igzip::status() == want;
 }
 
 fn main() {

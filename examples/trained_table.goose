@@ -16,6 +16,13 @@ fn report(label: const u8[:], size: i64) {
     print("  ", label, ": ", size, " bytes");
 }
 
+// The reason the last failing call gave, compared with a variant. Five lines
+// rather than a whole assertion shape at 40 call sites: with a bool return the
+// detail is out of band, in igzip::status().
+fn failed_as(want: igzip::Status) -> bool {
+    return igzip::status() == want;
+}
+
 fn main() {
     let argv = args();
     guard argv.len > 1 else {
@@ -36,13 +43,13 @@ fn main() {
         let lo = i * step;
         let hi = if i == MIN_SAMPLES - 1 { corpus.len } else { lo + step };
         let err = trainer.add(corpus[lo..hi]);
-        guard err.ok() else { abort(igzip::status_name(err)); };
+        guard err else { abort(igzip::error()); };
     }
     print("sampled ", trainer.symbols(), " symbols from ", corpus.len, " bytes");
 
     let tables, built = trainer.build();
-    guard built.ok() else {
-        abort(str("table build failed: ", igzip::status_name(built)));
+    guard built else {
+        abort(str("table build failed: ", igzip::error()));
     };
 
     // Compress the whole corpus three ways and compare.
@@ -52,11 +59,11 @@ fn main() {
     ct.set_tables(tables);
 
     let lv0, err0 = c0.compressed(corpus);
-    guard err0.ok() else { abort(igzip::status_name(err0)); };
+    guard err0 else { abort(igzip::error()); };
     let lv1, err1 = c1.compressed(corpus);
-    guard err1.ok() else { abort(igzip::status_name(err1)); };
+    guard err1 else { abort(igzip::error()); };
     let trained, errt = ct.compressed(corpus);
-    guard errt.ok() else { abort(igzip::status_name(errt)); };
+    guard errt else { abort(igzip::error()); };
 
     print("original: ", corpus.len, " bytes");
     report("level 0, default table", lv0.len);

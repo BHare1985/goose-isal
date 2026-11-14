@@ -1,9 +1,8 @@
 # Verification
 
-What `make verify` proves, and which file proves it. The claim behind all of it
-is the one in [AGENTS.md](../AGENTS.md): *a compressor can return `Ok` with a
-plausible size and still emit a broken stream, so passing tests are not evidence
-on their own.*
+What `make verify` proves, and which file proves it. The rule behind all of it:
+*a compressor can return `Ok` with a plausible size and still emit a broken
+stream, so passing tests are not evidence on their own.*
 
 | Command | What it runs |
 |---|---|
@@ -33,7 +32,7 @@ FDICT/DICTID and matching/mismatched IDs; trained tables, mid-flush swaps and
 `clear_tables`. Every custom-header stream is decoded back to the same body.
 
 **`test/inflate_contract.goose`** — the reader's state machine, cell by cell
-against the matrix in [design/0.3.0.md](design/0.3.0.md) §5 Q11; a terminal error
+against the matrix in [internals.md](internals.md); a terminal error
 latching; the copy guard and its recovery; `Truncated` from `finish`, from
 `inflated("")` and from `inflate`; `TooSmall` at the exact size, one byte short and
 a zero-length destination, and a clean reader after it; `NeedDict` and the resume

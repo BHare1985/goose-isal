@@ -40,7 +40,7 @@ fn name_of(w: igzip::Wrapper) -> const u8[:] {
 
 fn gz1(body: const u8[:]) -> i64 {
     let gz, err = igzip::gzip(body);
-    assert(err == igzip::Status.Ok);
+    assert(err);
     return gz.len;
 }
 
@@ -51,6 +51,9 @@ fn test_layout() {
     assert(igzip::trainer_size() == TRAINER_BYTES);
     assert(igzip::bound(0) > 0);
     assert(igzip::bound(1 << 20) > (1 << 20));
+    // No representable bound: igzip lengths are 32-bit, and a ceiling-sized
+    // "bound" would be no larger than the input it is supposed to cover.
+    assert(igzip::bound(igzip::MAX_INPUT) == 0);
 
     var t = igzip::trainer();
     assert(t.symbols() == 0);
@@ -63,7 +66,7 @@ fn test_roundtrip(body: const u8[:]) {
     var c = igzip::gzip_compressor(1);
 
     let gz, err = c.compressed(body);
-    assert(err == igzip::Status.Ok);
+    assert(err);
     assert(gz.len < body.len);
 
     // A gzip member with a fixed zero mtime: 1f 8b 08 00 00 00 00 00.
@@ -73,8 +76,8 @@ fn test_roundtrip(body: const u8[:]) {
 
     // The builder contract: compress appends, it does not overwrite.
     var two: u8[>..] = [];
-    assert(c.compress(body, two) == igzip::Status.Ok);
-    assert(c.compress(body, two) == igzip::Status.Ok);
+    assert(c.compress(body, two));
+    assert(c.compress(body, two));
     assert(two.len == gz.len * 2);
 
     // A compressor carries no state between calls, so reusing it after an error
@@ -82,9 +85,10 @@ fn test_roundtrip(body: const u8[:]) {
     var scr: u8[>..] = [];
     let saved = c.level;
     c.level = 9;
-    assert(c.compress(body, scr) == igzip::Status.BadLevel);
+    assert(!c.compress(body, scr));
+    assert(failed_as(igzip::Status.BadLevel));
     c.level = saved;
-    assert(c.compress(body, scr) == igzip::Status.Ok);
+    assert(c.compress(body, scr));
 }
 
 // The same input, twice, must give the same bytes: no clock, no counters, no
@@ -93,12 +97,12 @@ fn test_determinism(body: const u8[:]) {
     var c = igzip::gzip_compressor(1);
     let a, err_a = c.compressed(body);
     let b, err_b = c.compressed(body);
-    assert(err_a == igzip::Status.Ok && err_b == igzip::Status.Ok);
+    assert(err_a == true && err_b);
     assert(support::same(a, b));
 
     var c2 = igzip::gzip_compressor(1);
     let d, err_d = c2.compressed(body);
-    assert(err_d == igzip::Status.Ok);
+    assert(err_d);
     assert(support::same(a, d));
 }
 
@@ -109,9 +113,15 @@ fn test_independent_compressors(body: const u8[:]) {
 
     let ga, err_a = a.compressed(body);
     let gb, err_b = b.compressed(body);
-    assert(err_a == igzip::Status.Ok && err_b == igzip::Status.Ok);
+    assert(err_a == true && err_b);
     assert(ga.len == gz1(body));
-    assert(gb.len <= ga.len);
+    assert(gb.len <= igzip::bound(body.len));
+
+    // Independence means both streams decode to the body, not that level 3 is
+    // smaller: levels are different algorithms, and how they compare is a
+    // property of the kernels for the target. An ordering assertion here tests
+    // ISA-L's tuning, and the aarch64 build does not satisfy it for this body.
+    assert(decodes_to(ga, body) == true && decodes_to(gb, body));
 }
 
 fn test_wrappers(body: const u8[:]) {
@@ -120,26 +130,27 @@ fn test_wrappers(body: const u8[:]) {
 
     let r, err_r = raw.compressed(body);
     let z, err_z = zl.compressed(body);
-    assert(err_r == igzip::Status.Ok && err_z == igzip::Status.Ok);
+    assert(err_r == true && err_z);
 
     // The wrapper costs bytes: raw < zlib < gzip.
     assert(r.len < z.len);
     assert(z.len < gz1(body));
 }
 
+// Every level works and decodes back to the same bytes. Deliberately no size
+// ordering between levels: level 3 is a different algorithm (icf), not level 1
+// with a quality dial, and it comes out *larger* than level 1 on some bodies --
+// on aarch64 with this corpus, and on the event log in docs/guide.md (34.1%
+// against 34.0%). Ordering is ISA-L's tuning, not this package's contract.
 fn test_levels(body: const u8[:]) {
-    var sizes: i64[4] = [0; 4];
     for level in 4 {
         var c = igzip::gzip_compressor(level as i32);
         let out, err = c.compressed(body);
-        assert(err == igzip::Status.Ok);
+        assert(err);
         assert(out.len < body.len);
         assert(out.len <= igzip::bound(body.len));
-        sizes[level] = out.len;
+        assert(decodes_to(out, body));
     }
-    // The slower levels never come out larger on the same body.
-    assert(sizes[3] <= sizes[1]);
-    assert(sizes[1] <= sizes[0]);
 }
 
 // Sizes that sit on deflate's seams: empty, one byte, a stored-block header's
@@ -154,7 +165,7 @@ fn test_sizes() {
 
         var c = igzip::gzip_compressor(1);
         let out, err = c.compressed(body);
-        assert(err == igzip::Status.Ok);
+        assert(err);
         assert(out.len <= igzip::bound(n));
         // A body smaller than the 20-byte member header cannot shrink.
         if n >= 256 { assert(out.len < n); }
@@ -170,7 +181,7 @@ fn test_incompressible() {
     for level in 4 {
         var c = igzip::gzip_compressor(level as i32);
         let out, err = c.compressed(noise_bytes);
-        assert(err == igzip::Status.Ok);
+        assert(err);
         assert(out.len >= noise_bytes.len);
         assert(out.len <= igzip::bound(noise_bytes.len));
     }
@@ -181,27 +192,27 @@ fn test_training(body: const u8[:]) {
     assert(t.symbols() == 0);
 
     let half = body.len / 2;
-    assert(t.add(body[..half]) == igzip::Status.Ok);
+    assert(t.add(body[..half]));
     let seen = t.symbols();
     assert(seen > 0);
 
     // A second sample accumulates rather than replaces.
-    assert(t.add(body[half..]) == igzip::Status.Ok);
+    assert(t.add(body[half..]));
     assert(t.symbols() > seen);
 
     let tables, built = t.build();
-    assert(built == igzip::Status.Ok);
+    assert(built);
 
     var c = igzip::gzip_compressor(1);
     c.set_tables(tables);
     assert(c.level == 0); // igzip honours a supplied table at level 0 only
 
     let trained, err_t = c.compressed(body);
-    assert(err_t == igzip::Status.Ok);
+    assert(err_t);
 
     var c0 = igzip::gzip_compressor(0);
     let fallback, err_f = c0.compressed(body);
-    assert(err_f == igzip::Status.Ok);
+    assert(err_f);
 
     // On text of the trained kind, the table beats level 0's default.
     assert(trained.len < fallback.len);
@@ -209,7 +220,7 @@ fn test_training(body: const u8[:]) {
     // Dropping the table returns to the ordinary levels.
     c.clear_tables(1);
     let plain, err_p = c.compressed(body);
-    assert(err_p == igzip::Status.Ok);
+    assert(err_p);
     assert(plain.len == gz1(body));
 }
 
@@ -219,18 +230,18 @@ fn test_training_generalizes(body: const u8[:]) {
     let half = body.len / 2;
 
     var t = igzip::trainer();
-    assert(t.add(body[..half]) == igzip::Status.Ok);
+    assert(t.add(body[..half]));
     let tables, built = t.build();
-    assert(built == igzip::Status.Ok);
+    assert(built);
 
     var ct = igzip::gzip_compressor(1);
     ct.set_tables(tables);
     let trained, err_t = ct.compressed(body[half..]);
-    assert(err_t == igzip::Status.Ok);
+    assert(err_t);
 
     var c0 = igzip::gzip_compressor(0);
     let plain, err_p = c0.compressed(body[half..]);
-    assert(err_p == igzip::Status.Ok);
+    assert(err_p);
 
     assert(trained.len <= plain.len);
 }
@@ -239,7 +250,7 @@ fn test_training_generalizes(body: const u8[:]) {
 // per content type instead of 19 KB.
 fn test_counts_roundtrip(body: const u8[:]) {
     var t = igzip::trainer();
-    assert(t.add(body) == igzip::Status.Ok);
+    assert(t.add(body));
     let before = t.symbols();
 
     var h = igzip::histogram();
@@ -250,7 +261,7 @@ fn test_counts_roundtrip(body: const u8[:]) {
 
     let a, ok_a = t.build();
     let b, ok_b = t2.build();
-    assert(ok_a == igzip::Status.Ok && ok_b == igzip::Status.Ok);
+    assert(ok_a == true && ok_b);
     for i in 279 { assert(a.raw[i] == b.raw[i]); }
 }
 
@@ -266,73 +277,106 @@ fn test_bad_tables(body: const u8[:]) {
     var c = igzip::gzip_compressor(1);
     c.set_tables(bad_count);
     var out: u8[>..] = [];
-    assert(c.compress(body, out) == igzip::Status.BadTable);
+    assert(!c.compress(body, out));
+    assert(failed_as(igzip::Status.BadTable));
     assert(out.len == 0);
 
     var bad_bits = igzip::tables();
     bad_bits.raw[41] = 100 | (0x10000 << 32); // sane count, impossible bit count
     c.set_tables(bad_bits);
-    assert(c.compress(body, out) == igzip::Status.BadTable);
+    assert(!c.compress(body, out));
+    assert(failed_as(igzip::Status.BadTable));
     assert(out.len == 0);
 
     // A real table still passes the same check.
     var t = igzip::trainer();
-    assert(t.add(body) == igzip::Status.Ok);
+    assert(t.add(body));
     let good, built = t.build();
-    assert(built == igzip::Status.Ok);
+    assert(built);
     c.set_tables(good);
-    assert(c.compress(body, out) == igzip::Status.Ok);
+    assert(c.compress(body, out));
     assert(out.len > 0);
 }
 
 fn test_errors(body: const u8[:]) {
     var c = igzip::gzip_compressor(9);
     var out: u8[>..] = [];
-    assert(c.compress(body, out) == igzip::Status.BadLevel);
+    assert(!c.compress(body, out));
+    assert(failed_as(igzip::Status.BadLevel));
     assert(out.len == 0);
 
     c.level = -1;
-    assert(c.compress(body, out) == igzip::Status.BadLevel);
+    assert(!c.compress(body, out));
+    assert(failed_as(igzip::Status.BadLevel));
 
     // The one-shot form validates the level too.
     let none, err = igzip::gzip(body, 4);
-    assert(err == igzip::Status.BadLevel);
+    assert(!err);
+    assert(failed_as(igzip::Status.BadLevel));
     assert(none.len == 0);
 
     // An untrained table still compresses: every literal keeps a code.
     var blank = igzip::tables();
     c.clear_tables(0);
     c.set_tables(blank);
-    assert(c.compress(body, out) != igzip::Status.Other);
+    assert(c.compress(body, out));
+    assert(!failed_as(igzip::Status.Other));
 
     assert(igzip::status_name(igzip::Status.BadLevel).len > 0);
 
-    // A Status is not a condition in Goose, so this is how the common case is
-    // spelled: one predicate instead of a comparison.
-    assert(igzip::Status.Ok.ok());
-    assert(!igzip::Status.BadLevel.ok());
-    assert(c.compress(body, out).ok() || !c.compress(body, out).ok());
+    // A call reports success as a bool, and the reason lives in status().
+
+    // Every variant names itself, and no two share a name. The loop comes from
+    // the enum's own metadata, so a variant added later cannot be forgotten
+    // here -- the match in status_name would not compile without an arm, and
+    // this catches the other half: an arm that says the same thing twice.
+    const for <N, V> in variants<igzip::Status> {
+        assert(igzip::status_name(V).len > 0);
+        // The code each variant maps to, and back: status() and error() depend
+        // on this being an inverse pair.
+        assert(igzip::status_name(igzip::status_of(igzip::status_code(V))) ==
+               igzip::status_name(V));
+        const for <N2, W> in variants<igzip::Status> {
+            if N != N2 { assert(!(igzip::status_name(V) == igzip::status_name(W))); }
+        }
+    }
+
+    // The format overload renders the same words wherever text goes, so
+    // `print(err)` and `str("failed: ", err)` need no status_name call.
+    assert(str(igzip::Status.BadChecksum) == igzip::status_name(igzip::Status.BadChecksum));
+    // The spelling the guide recommends for a diagnostic.
+    assert(str("finish failed: ", igzip::Status.Truncated).len > "finish failed: ".len);
 }
 
 fn test_empty() {
     let gz, err = igzip::gzip("");
-    assert(err == igzip::Status.Ok);
+    assert(err);
     assert(gz.len == 20); // 10-byte header, empty block, 8-byte trailer
 }
 
 // Every artifact scripts/check_gzip.py expects, written from one place so the
 // tests above stay pure assertions. The checker discovers these by name, so a
 // new case here needs no Python change.
+// One member, decoded in memory: the assertion every level and compressor
+// comparison needs, without writing an artifact.
+fn decodes_to(stream: const u8[:], want: const u8[:]) -> bool {
+    var r = igzip::gzip_reader();
+    let out, err = r.inflated(stream);
+    return err && support::same(out, want);
+}
+
 // The self-hosting half: this package reads back what it wrote. Assertion
 // messages name the artifact, so a failure says which stream is wrong.
 fn decode_is(what: const u8[:], wrap: igzip::Wrapper, stream: const u8[:], want: const u8[:]) {
     var r = igzip::reader(wrap);
     let out, err = r.inflated(stream);
-    guard err == igzip::Status.Ok else { abort(str("artifact ", what, " does not decode")); };
+    guard err == true else { abort(str("artifact ", what, " does not decode")); };
     guard support::same(out, want) else { abort(str("artifact ", what, " decodes to the wrong bytes")); };
 }
 
 fn write_artifacts(body: const u8[:]) {
+    assert(make_dir("build"));
+    assert(make_dir("build/tmp"));
     assert(make_dir(TMP));
     assert(write_file(str(TMP, "/body.txt"), body));
 
@@ -344,7 +388,7 @@ fn write_artifacts(body: const u8[:]) {
         for level in 4 {
             var c = igzip::compressor(w, level as i32);
             let out, err = c.compressed(body);
-            assert(err == igzip::Status.Ok);
+            assert(err);
             let path = str(dir, "/", name_of(w), "_", level, ".", ext_of(w));
             assert(write_file(path, out));
             decode_is(path, w, out, body);
@@ -359,7 +403,7 @@ fn write_artifacts(body: const u8[:]) {
         support::body_of(src, n);
         var c = igzip::gzip_compressor(1);
         let out, err = c.compressed(src);
-        assert(err == igzip::Status.Ok);
+        assert(err);
         assert(write_file(str(TMP, "/size_", n, ".gz"), out));
         assert(write_file(str(TMP, "/size_", n, ".bin"), src));
         decode_is(str("size_", n), igzip::Wrapper.Gzip, out, src);
@@ -370,22 +414,22 @@ fn write_artifacts(body: const u8[:]) {
     support::noise(noise_bytes, 65536);
     var cn = igzip::gzip_compressor(1);
     let noisy, err_n = cn.compressed(noise_bytes);
-    assert(err_n == igzip::Status.Ok);
+    assert(err_n);
     assert(write_file(str(TMP, "/incompressible.gz"), noisy));
     assert(write_file(str(TMP, "/incompressible.bin"), noise_bytes));
     decode_is("incompressible", igzip::Wrapper.Gzip, noisy, noise_bytes);
 
     var lv1 = igzip::gzip_compressor(1);
     let gz, err_1 = lv1.compressed(body);
-    assert(err_1 == igzip::Status.Ok);
+    assert(err_1);
     assert(write_file(str(TMP, "/twice_a.gz"), gz));
     assert(write_file(str(TMP, "/twice_b.gz"), gz));
 
     // Two members appended into one buffer: gzip allows it, and the checker
     // expects the body twice over.
     var two: u8[>..] = [];
-    assert(lv1.compress(body, two) == igzip::Status.Ok);
-    assert(lv1.compress(body, two) == igzip::Status.Ok);
+    assert(lv1.compress(body, two));
+    assert(lv1.compress(body, two));
     assert(write_file(str(TMP, "/twomembers.gz"), two));
     var doubled: u8[>..] = [];
     doubled.append(body);
@@ -393,27 +437,34 @@ fn write_artifacts(body: const u8[:]) {
     decode_is("twomembers", igzip::Wrapper.Gzip, two, doubled);
 
     var t = igzip::trainer();
-    assert(t.add(body) == igzip::Status.Ok);
+    assert(t.add(body));
     let tables, built = t.build();
-    assert(built == igzip::Status.Ok);
+    assert(built);
     var trained_c = igzip::gzip_compressor(1);
     trained_c.set_tables(tables);
     let trained, err_t = trained_c.compressed(body);
-    assert(err_t == igzip::Status.Ok);
+    assert(err_t);
     assert(write_file(str(TMP, "/trained.gz"), trained));
     decode_is("trained", igzip::Wrapper.Gzip, trained, body);
 
     // The same table on a body it never sampled.
     let half = body.len / 2;
     let other, err_o = trained_c.compressed(body[half..]);
-    assert(err_o == igzip::Status.Ok);
+    assert(err_o);
     assert(write_file(str(TMP, "/trained_half.gz"), other));
     decode_is("trained_half", igzip::Wrapper.Gzip, other, body[half..]);
 
     let empty, err_e = igzip::gzip("");
-    assert(err_e == igzip::Status.Ok);
+    assert(err_e);
     assert(write_file(str(TMP, "/empty.gz"), empty));
     decode_is("empty", igzip::Wrapper.Gzip, empty, "");
+}
+
+// The reason the last failing call gave, compared with a variant. Five lines
+// rather than a whole assertion shape at 40 call sites: with a bool return the
+// detail is out of band, in igzip::status().
+fn failed_as(want: igzip::Status) -> bool {
+    return igzip::status() == want;
 }
 
 fn main() {

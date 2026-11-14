@@ -43,6 +43,13 @@ fn verify_prefix(plain: const u8[:], body: const u8[:], verified: i64) -> i64 {
     return verified + plain.len;
 }
 
+// The reason the last failing call gave, compared with a variant. Five lines
+// rather than a whole assertion shape at 40 call sites: with a bool return the
+// detail is out of band, in igzip::status().
+fn failed_as(want: igzip::Status) -> bool {
+    return igzip::status() == want;
+}
+
 fn main() {
     var body: u8[>..] = [];
     make_body(body);
@@ -56,9 +63,9 @@ fn main() {
 
     for i in REPS {
         out.clear();
-        assert(w.write(body, out) == igzip::Status.Ok);
+        assert(w.write(body, out));
         let used, err = r.read(out, plain);
-        assert(err == igzip::Status.Ok);
+        assert(err);
         assert(used == out.len);
         verified = verify_prefix(plain, body, verified);
         plain.clear();
@@ -69,7 +76,7 @@ fn main() {
     // The finish output is the trailer on its own: the last round's compressed
     // bytes were already fed to the reader above.
     out.clear();
-    assert(w.finish(out) == igzip::Status.Ok);
+    assert(w.finish(out));
     assert(w.state == igzip::WriterState.Finished);
     assert(w.total_in == fed as u64);
 
@@ -78,11 +85,11 @@ fn main() {
     let isize = u32_le(out, out.len - 4);
     assert(isize == (fed & 0xFFFFFFFF) as u32);
     let used_tail, tail_err = r.read(out, plain);
-    assert(tail_err == igzip::Status.Ok);
+    assert(tail_err);
     assert(used_tail == out.len);
     verified = verify_prefix(plain, body, verified);
     assert(r.finished());
-    assert(r.finish() == igzip::Status.Ok);
+    assert(r.finish());
 
     // Every byte that went in came out: the reader's total is a u64 and does not
     // wrap at igzip's 32-bit total_out, which this stream passes four times.

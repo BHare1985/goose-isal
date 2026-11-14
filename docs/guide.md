@@ -35,8 +35,14 @@ chunk and appends only the bytes produced), and decompressed output is appended
 from the `Reader`'s chunk. Callers never loop over `avail_out`; the package does.
 
 `bound(n)` is an upper bound on the compressed size of `n` bytes at any level and
-wrapper, for a caller that needs to reserve room up front. Decompression has no
-bound, which is what `inflate` and `TooSmall` exist for.
+wrapper, for a caller that needs to reserve room up front. It returns `0` when
+there is no bound to give: a negative length, or one so large that the bound
+would not fit igzip's 32-bit lengths. Decompression has no bound, which is what
+`inflate` and `TooSmall` exist for.
+
+Chunking is not part of the format. How a body is split across `write` calls can
+change which block boundaries igzip picks, so two chunkings can yield different
+but equally valid bytes; compare decoded output, not compressed bytes.
 
 ## Streaming compression
 
@@ -44,10 +50,10 @@ bound, which is what `inflate` and `TooSmall` exist for.
 var w = igzip::zlib_writer(1);
 var out: u8[>..] = [];
 
-guard w.write(header_json, out).ok() else { abort("write failed"); };
-guard w.flush(out).ok() else { abort("flush failed"); };   // a decode point
-guard w.write(rows_json, out).ok() else { abort("write failed"); };
-guard w.finish(out).ok() else { abort("finish failed"); };
+guard w.write(header_json, out) else { abort("write failed"); };
+guard w.flush(out) else { abort("flush failed"); };   // a decode point
+guard w.write(rows_json, out) else { abort("write failed"); };
+guard w.finish(out) else { abort("finish failed"); };
 ```
 
 The lifecycle is `Fresh → HeaderWritten → Open → Flushed → Finished`, with
@@ -75,10 +81,10 @@ input.
 var r = igzip::gzip_reader();
 var body: u8[>..] = [];
 
-let used, err = r.read(gz, body);
-guard err.ok() else { abort(igzip::status_name(err)); };
+let used, ok = r.read(gz, body);
+guard ok else { abort(str("read failed: ", igzip::error())); };
 guard r.finished() else { abort("member is incomplete: feed more"); };
-guard r.finish().ok() else { abort("truncated"); };
+guard r.finish() else { abort("truncated"); };
 ```
 
 `read` returns a count as well as a status because decompression does not consume
@@ -107,14 +113,14 @@ cannot go on reading `Ok` out of a dead stream. `finish` after such an error is
 ```goose
 var pos: i64 = 0;
 loop {
-    let used, err = r.read(all[pos..], body);
-    guard err.ok() else { abort(igzip::status_name(err)); };
+    let used, ok = r.read(all[pos..], body);
+    guard ok else { abort(str("read failed: ", igzip::error())); };
     pos += used;
     if !r.finished() { break; }
     if pos == all.len { break; }
-    guard r.reset().ok() else { abort("reset failed"); };
+    guard r.reset() else { abort("reset failed"); };
 }
-guard r.finish().ok() else { abort("truncated"); };
+guard r.finish() else { abort("truncated"); };
 ```
 
 `inflated(src)` runs that loop for you and joins the members. Trailing garbage
@@ -159,9 +165,9 @@ var w = igzip::gzip_writer(1);
 var out: u8[>..] = [];
 let hdr = igzip::GzipHeader { os: 3, name: "report.csv", mtime: 0 };
 
-guard w.write_gzip_header(hdr, out).ok() else { abort("header failed"); };
-guard w.write(body, out).ok() else { abort("write failed"); };
-guard w.finish(out).ok() else { abort("finish failed"); };
+guard w.write_gzip_header(hdr, out) else { abort("header failed"); };
+guard w.write(body, out) else { abort("write failed"); };
+guard w.finish(out) else { abort("finish failed"); };
 ```
 
 `mtime` defaults to 0 and `os` to 0xff, so a header left alone is reproducible.
@@ -183,8 +189,8 @@ buffer without decoding or copying anything. They report the fields and the
 *offsets* of the optional parts, so a caller slices the input it already has:
 
 ```goose
-var info, err = igzip::read_gzip_header(gz);
-guard err.ok() else { abort(igzip::status_name(err)); };
+var info, ok = igzip::read_gzip_header(gz);
+guard ok else { abort(str("header failed: ", igzip::error())); };
 
 let name = gz[info.name_at..][..info.name_len];   // name_at is -1 when absent
 let body = gz[info.body_at..];                    // the deflate stream
@@ -216,9 +222,9 @@ A preset dictionary is history both sides already have, so it need not be sent.
 
 ```goose
 var w = igzip::zlib_writer(1);
-guard w.set_dict(dictionary).ok() else { abort("dictionary failed"); };
-guard w.write(payload, out).ok() else { abort("write failed"); };
-guard w.finish(out).ok() else { abort("finish failed"); };
+guard w.set_dict(dictionary) else { abort("dictionary failed"); };
+guard w.write(payload, out) else { abort("write failed"); };
+guard w.finish(out) else { abort("finish failed"); };
 ```
 
 A zlib stream with a dictionary advertises FDICT and DICTID automatically.
@@ -238,7 +244,7 @@ var out: u8[>..] = [];
 
 let used, err = r.read(member, out);
 guard err == igzip::Status.NeedDict else { /* no dictionary needed */ };
-guard r.set_dict(dictionary).ok() else { abort("set_dict failed"); };
+guard r.set_dict(dictionary) else { abort("set_dict failed"); };
 let u2, e2 = r.read(member[used..], out);      // continues from where it stopped
 ```
 
@@ -254,7 +260,7 @@ Two facts worth knowing:
 - igzip **never compares** the dictionary against the stream's DICTID. With a
   gzip or zlib trailer a wrong dictionary is caught at the end (`BadChecksum`);
   on a **raw** stream there is no trailer and nothing catches it — you get wrong
-  bytes with `Status.Ok`. Use a wrapper when the bytes must be trusted.
+  bytes and no error. Use a wrapper when the bytes must be trusted.
 
 ## Trained tables
 
@@ -270,7 +276,7 @@ t.add(json_body);                              // sample bodies as they go by
 guard t.symbols() >= 64 * 1024 else { /* keep warming */ };
 
 let tables, built = t.build();
-guard built.ok() else { abort(igzip::status_name(built)); };
+guard built else { abort(str("training failed: ", igzip::error())); };
 c.set_tables(tables);                          // level 0 from here on
 ```
 
@@ -294,6 +300,12 @@ Numbers, on an event-log API serving 1.9 KB responses (`make bench` reproduces i
 
 At 9.4 KB per response: 20.5% at 19 µs for level 1, **20.8% at 11 µs** for the
 trained table. Same bytes out, 3.8x and 1.6x less time in.
+
+The levels are different algorithms, not one algorithm with a quality dial.
+Level 3 is slower and is not always smaller: it is a tenth of a point behind
+level 1 on the table above, and on aarch64 it comes out larger on the test
+corpus. Treat a level as a speed/ratio point to measure on your own data, and
+never assert an ordering between levels -- this package's tests do not.
 
 ## Threads and memory
 
@@ -326,9 +338,40 @@ trained table. Same bytes out, 3.8x and 1.6x less time in.
 | `Corrupt` | the bytes are not a valid deflate stream |
 | `BadChecksum` | the trailer does not match the decoded bytes |
 
-A `Status` is not a condition in Goose — it takes a `bool` or an optional — so the
-common case is `guard err.ok() else { ... }`, and a specific failure is
-`err == igzip::Status.BadTable`.
+Every call that can fail returns a `bool`, with any data in front of it:
+
+```goose
+let used, ok = r.read(gz, body);
+guard ok else { abort(str("read failed: ", igzip::error())); };
+```
+
+The reason is out of band, in the two accessors `goose_gfx` uses:
+`igzip::error()` is that reason as text, and `igzip::status()` is the `Status`
+itself, for a caller that needs to branch. Both describe the call just made —
+success included, which clears them — and both are per thread, so a worker's
+failure is its own:
+
+```goose
+let used, ok = r.read(gz, body);
+guard ok else {
+    match igzip::status() {
+        Truncated => { /* feed more, or re-fetch */ },
+        Corrupt => { /* drop it */ },
+        NeedDict => { /* set_dict, then keep reading */ },
+        _ => { abort(igzip::error()); },
+    }
+}
+```
+
+`Status` is `Ok`, twelve named failures and `Other`; it prints itself, so
+`str("finish failed: ", err)` needs no `status_name` call. `igzip::status()`
+returns a plain `Status` — `Ok` when the call succeeded — so a caller can match
+it directly without unwrapping anything, as above.
+
+`guard` is the whole idiom: a call reports success as a `bool`, so `guard call
+else { ... }` is the shape, whether the call returns a status alone or data and
+a status. Non-status preconditions read the same way: `guard r.finished() else {
+... }`.
 
 One thing to expect: a corrupted payload often comes back as `Ok` with the member
 unfinished rather than as an error, because igzip reports completion in a block

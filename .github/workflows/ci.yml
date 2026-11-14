@@ -1,0 +1,170 @@
+# Build, test and decode on every platform Goose ships a compiler for.
+#
+# Four targets, because that is what exists: Goose publishes linux-x64,
+# macos-x64, macos-arm64 and windows-x64. There is no linux-arm64 build of the
+# compiler, so that target would mean building Goose from source -- a different
+# project, and not something this workflow should smuggle in.
+#
+# ISA-L itself is fine on all four: its CMake picks nasm's format per platform
+# (elf64 / macho64 / win64) and has aarch64 kernels for Apple Silicon.
+#
+# The two macOS legs need macOS runners, which GitHub-hosted runners supply from
+# a separate pool: those jobs can wait in the queue, or be cancelled before a
+# runner is assigned, and that is runner availability rather than this workflow.
+# The Linux and Windows legs run anywhere.
+#
+# What each job proves: the package typechecks, the C compiles against the
+# vendored ISA-L (which is the part that differs per platform -- assembly
+# format, thread-local spelling, MSVC), the round trip decodes, and the two
+# native tests build and run. `make` is deliberately not used: the Makefile is
+# POSIX and would fail on Windows for reasons that have nothing to do with this
+# package.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: # so a branch can be exercised without opening a PR
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-24.04
+            goose: goose-v2026.4-linux-x64.tar.gz
+          - name: macos-x64
+            os: macos-15-intel
+            goose: goose-v2026.4-macos-x64.tar.gz
+          - name: macos-arm64
+            os: macos-15
+            goose: goose-v2026.4-macos-arm64.tar.gz
+          - name: windows-x64
+            os: windows-latest
+            goose: goose-v2026.4-windows-x64.zip
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      # ISA-L's x86-64 kernels are nasm, and without nasm its build falls back
+      # to portable C -- which would make the matrix prove nothing. Every runner
+      # needs it installed, macOS included: the first macOS run failed here.
+      - name: nasm
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y nasm
+
+      - name: nasm (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nasm || brew upgrade nasm
+
+      - name: nasm (Windows)
+        if: runner.os == 'Windows'
+        run: choco install nasm -y --no-progress
+
+      - name: Goose
+        shell: bash
+        env:
+          ASSET: ${{ matrix.goose }}
+        run: |
+          set -euo pipefail
+          tag=$(sed -n 's/.*goose-\(v[0-9.]*\)-.*/\1/p' <<< "$ASSET")
+          url="https://github.com/aardappel/goose/releases/download/$tag/$ASSET"
+          mkdir -p "$RUNNER_TEMP/goose"
+          curl -fsSL --proto '=https' --tlsv1.2 "$url" -o "$RUNNER_TEMP/$ASSET"
+          if [[ "$ASSET" == *.zip ]]; then
+            unzip -q -o "$RUNNER_TEMP/$ASSET" -d "$RUNNER_TEMP/goose"
+          else
+            tar -xzf "$RUNNER_TEMP/$ASSET" -C "$RUNNER_TEMP/goose"
+          fi
+          bin=$(find "$RUNNER_TEMP/goose" -maxdepth 3 \( -name goose -o -name goose.exe \) -type f | head -1)
+          test -n "$bin"
+          chmod +x "$bin" 2>/dev/null || true
+          echo "$(dirname "$bin")" >> "$GITHUB_PATH"
+          "$bin" version
+
+      # The native parts (ISA-L, the shim) are what differ per platform, and
+      # they are the slow step, so they are cached by the ISA-L commit.
+      - name: cache the package's native build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.goose/build
+          key: native-${{ matrix.name }}-${{ hashFiles('CMakeLists.txt', 'src/igzip_shim.c', '.gitmodules') }}
+          restore-keys: native-${{ matrix.name }}-
+
+      - name: typecheck
+        shell: bash
+        run: goose check igzip.goose
+
+      # Every test root is a program: the package decodes what it wrote, so a
+      # passing assertion is the point, not a printed size.
+      - name: round trip and contract tests (JIT)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in test/contract.goose test/header_contract.goose test/inflate_contract.goose \
+                   test/roundtrip.goose test/streaming.goose test/writer_contract.goose; do
+            echo "== $f"
+            goose run --debug "$f"
+          done
+
+      # Threads and the 4.2 GiB stream need a native build; the JIT cannot place
+      # thread-local storage, and the large test would be minutes under it.
+      - name: threads (native)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          goose build test/threads.goose -o "$RUNNER_TEMP/threads"
+          "$RUNNER_TEMP/threads"
+
+      # Windows builds and runs the threaded program like the other three. The
+      # run used to be tolerated with a warning; it is asserted now. What once
+      # failed there was the main program's body generation, not this package
+      # (ROADMAP.md, "Compiling a body twice in the main program").
+      - name: threads (native, Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          goose build test/threads.goose -o "$RUNNER_TEMP/threads.exe"
+          "$RUNNER_TEMP/threads.exe"
+
+      - name: 4.2 GiB round trip (native)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          goose build test/large_stream.goose -o "$RUNNER_TEMP/large_stream"
+          "$RUNNER_TEMP/large_stream"
+
+      # Two things the local targets run that CI should not skip: the ASan
+      # harnesses (bounds and hostile input on the shim itself) and the
+      # independent decoder. Both are cheap and ubuntu has what they need, so
+      # they live on the Linux leg rather than being a local-only ritual.
+      - name: make stress (AddressSanitizer)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: make stress
+
+      - name: independent decode (CPython zlib)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          GOOSE_HOME="$HOME/.goose" make crosscheck
+
+      - name: examples typecheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in examples/*.goose; do goose check "$f"; done

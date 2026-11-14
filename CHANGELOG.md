@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.4.0 — unreleased
+
+### Changed (breaking)
+
+- **A call that can fail returns a `bool`, with its data in front of it** —
+  `let used, ok = r.read(..)`, `let gz, ok = c.compressed(..)` — and the reason is
+  out of band, in the two accessors `goose_gfx` uses: `igzip::error()` for text,
+  `igzip::status()` for the `Status`. `Status` lost its `Ok` variant (it is *why
+  a call failed*) and `ok()` is gone.
+
+  ```goose
+  guard w.finish(out) else { abort(str("finish failed: ", igzip::error())); };
+
+  guard ok else {
+      match igzip::status() {
+          Truncated => ...,
+          Corrupt => ...,
+          _ => ...,
+      }
+  }
+  ```
+
+  `igzip::status()` returns a plain `Status` — `Ok` when the call succeeded — so
+  a caller branches on it directly, with no optional to unwrap.
+
+  Migrating: `guard x.ok()` becomes `guard x else`, `assert(e == Status.Ok)`
+  becomes `assert(e)`, and a specific failure is `assert(!e)` followed by
+  `assert(igzip::status() == Status.X)`. Every call records its outcome and
+  success clears the record, so `status()` is `Ok` exactly when the bool was
+  true. The record is per thread, so a worker's failure is its own.
+- `Status` implements `format`, so `print(err)` needs no `status_name` call.
+
+- **`bound(n)` returns `0` when there is no bound to give** — a negative length,
+  or one so large that the bound would not fit in the 32 bits igzip's lengths
+  use. It used to clamp to `0x7FFFFFF0`, which for an input of about 2 GiB is a
+  "bound" no larger than the input, and a stored block of incompressible input
+  can overrun that.
+
+### Internals
+
+- The C boundary refuses a slice whose length is non-zero and whose data pointer
+  is null, at every entry point that dereferences one. Goose cannot build such a
+  value and `from_bytes` rejects one, but the shim is a C API as well.
+- The per-thread status (`_Thread_local` in `src/igzip_shim.c`) is the one piece
+  of mutable state in the package, and the one exception to the shim's
+  no-statics rule. It is per thread, written by every fallible call and read only
+  by `status()` / `error()`.
+- Every ISA-L number the two status tables are keyed on is `_Static_assert`ed.
+- Four defensive count checks in the shim: the memcpy length and the builder's
+  stack top come from a checked number rather than one written by code the shim
+  does not own.
+
 ## 0.3.0 — 2026-11-14
 
 The other half of the codec: the package now reads what it writes, and its own

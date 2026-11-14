@@ -45,7 +45,11 @@ let BOX = 65536;
 struct RoundBox {
     records: i32,
     len:     i32,
-    data:    u8[BOX],
+    // The checksum of the body this member was made from. The reader worker
+    // rebuilds that body itself, so on a mismatch this says which side is
+    // wrong: the bytes it generated, or the bytes it decoded.
+    sum:  i64,
+    data: u8[BOX],
 }
 
 struct RoundResult {
@@ -58,12 +62,16 @@ let STREAM_WORKERS = 2;
 let STREAM_JOBS = 6;
 let ROUND_JOBS = 4;
 
+// One JSON record, appended: the unit both the main thread and the reader
+// worker build their bodies from.
+fn make_record(out: u8[>..]&, i: i32) {
+    format(out, "{\"id\":", i, ",\"user\":\"alice\",\"email\":\"alice@example.com\",",
+           "\"active\":true,\"score\":", i * 37 % 1000, ",\"tags\":[\"alpha\",\"beta\"]},\n");
+}
+
 // One JSON schema, N records: the body a worker compresses.
 fn make_body(out: u8[>..]&, records: i32) {
-    for i in records {
-        format(out, "{\"id\":", i, ",\"user\":\"alice\",\"email\":\"alice@example.com\",",
-               "\"active\":true,\"score\":", i * 37 % 1000, ",\"tags\":[\"alpha\",\"beta\"]},\n");
-    }
+    for i in records { make_record(out, i); }
 }
 
 thread_fn worker() {
@@ -83,10 +91,10 @@ thread_fn worker() {
         let err = c.compress(body, out);
 
         var code: i32 = 0;
-        if !err.ok() { code = 1; }
+        if !err { code = 1; }
         qput(Result {
             records: job.records,
-            size:    if err == igzip::Status.Ok { out.len as i32 } else { -1 },
+            size:    if err == true { out.len as i32 } else { -1 },
             code:    code,
         });
     }
@@ -110,11 +118,11 @@ thread_fn stream_worker() {
         out.clear();
         let err = holder[0].write(body, out);
         var code: i32 = 0;
-        if err.ok() {
+        if err {
             let done = holder[0].finish(out);
-            if done.ok() {
+            if done {
                 let again = holder[0].reset();
-                if !again.ok() { code = 3; }
+                if !again { code = 3; }
             } else {
                 code = 2;
             }
@@ -147,15 +155,31 @@ thread_fn reader_worker() {
         out.clear();
         let used, err = holder[0].read(box.data[..box.len], out);
         var code: i32 = 0;
-        if used != box.len || !err.ok() {
+        if used != box.len || !err {
             code = 1;
         } else if !holder[0].finished() {
             code = 2;
         } else if !same_bytes(out, body) {
+            // Say how it diverged: a different length points at the box or the
+            // queue, a same-length difference at the decode itself. `box.sum`
+            // is the body the member was made from, so whichever of `out` and
+            // `body` matches it is the one that is right.
+            var at: i64 = -1;
+            var k:  i64 = 0;
+            while k < out.len && k < body.len {
+                if out[k] != body[k] { at = k; break; }
+                k++;
+            }
+            print("threads: mismatch records=", box.records, " box.len=", box.len,
+                  " out.len=", out.len, " body.len=", body.len, " at=", at,
+                  " box.sum=", box.sum, " out.sum=", checksum(out),
+                  " body.sum=", checksum(body));
+            show_around("  out", out, at);
+            show_around("  body", body, at);
             code = 3;
-        } else if !holder[0].finish().ok() {
+        } else if !holder[0].finish() {
             code = 4;
-        } else if !holder[0].reset().ok() {
+        } else if !holder[0].reset() {
             code = 5;
         }
         qput(RoundResult {
@@ -166,6 +190,28 @@ thread_fn reader_worker() {
     }
 }
 
+// A position-sensitive checksum, so two bodies that differ anywhere do not
+// collide by accident: i64 arithmetic, no wrap, the same function on both
+// sides of the comparison.
+fn checksum(xs: const u8[:]) -> i64 {
+    var h: i64 = 0;
+    for x in xs { h = (h * 31 + x) % 1000000007; }
+    return h;
+}
+
+// A log with no hexdump, for the bytes either side of the first difference.
+fn show_around(tag: const u8[:], xs: const u8[:], at: i64) {
+    guard at >= 0 else { return; }
+    var from = at - 8;
+    if from < 0 { from = 0; }
+    var to = at + 16;
+    if to > xs.len { to = xs.len; }
+    var line: u8[>..] = [];
+    format(line, tag, " [", from, "..", to, "):");
+    for i in from..to { format(line, " ", xs[i] as i64); }
+    print(line);
+}
+
 // Byte equality, local to this file: threads.goose does not import the support
 // module, and a worker comparing what it decoded is the whole point here.
 fn same_bytes(a: const u8[:], b: const u8[:]) -> bool {
@@ -174,6 +220,13 @@ fn same_bytes(a: const u8[:], b: const u8[:]) -> bool {
         if x != b[i] { return false; }
     }
     return true;
+}
+
+// The reason the last failing call gave, compared with a variant. Five lines
+// rather than a whole assertion shape at 40 call sites: with a bool return the
+// detail is out of band, in igzip::status().
+fn failed_as(want: igzip::Status) -> bool {
+    return igzip::status() == want;
 }
 
 fn main() {
@@ -188,19 +241,35 @@ fn main() {
     for i in STREAM_WORKERS { qput(StreamJob { records: -1 }); }
 
     // Members compressed on this thread, to be decoded by a worker thread.
+    //
+    // The body for N records is a prefix of the body for N+k, so the largest is
+    // built once and sliced. That is also the only shape that works on
+    // windows-x64 with Goose v2026.4: MSVC miscompiles a second format-driven
+    // build of a growable buffer in the main program (ROADMAP.md). The reader
+    // worker still regenerates each body from scratch, so a wrong body fails.
+    var body: u8[>..]  = [];
+    var ends: i64[>..] = [];
+    for i in 100 + (ROUND_JOBS - 1) * 75 {
+        make_record(body, i as i32);
+        ends.push(body.len);
+    }
+
     var w = igzip::gzip_writer(1);
     var member: u8[>..] = [];
-    var body:   u8[>..] = [];
     for i in ROUND_JOBS {
         let records = 100 + i * 75;
-        body.clear();
-        make_body(body, records as i32);
+        let prefix = ends[records - 1];
         member.clear();
-        assert(w.write(body, member) == igzip::Status.Ok);
-        assert(w.finish(member) == igzip::Status.Ok);
-        assert(w.reset() == igzip::Status.Ok);
+        assert(w.write(body[..prefix], member));
+        assert(w.finish(member));
+        assert(w.reset());
         assert(member.len <= BOX);
-        var box = RoundBox { records: records as i32, len: member.len as i32, .. };
+        var box = RoundBox {
+            records: records as i32,
+            len:     member.len as i32,
+            sum:     checksum(body[..prefix]),
+            ..
+        };
         box.data[..member.len].move_from(member[..]);
         qput(box);
     }
@@ -252,15 +321,25 @@ fn main() {
     }
     guard stream_shared_seen == 2 else { abort("the shared streaming job did not come back twice"); };
 
-    // Members compressed here, decoded on another thread, byte for byte.
+    // Members compressed here, decoded on another thread, byte for byte. Every
+    // result is collected before deciding, so one run reports every failing
+    // member rather than the first one to arrive.
     var rounds_seen = 0;
+    var round_failures = 0;
+    var first_failure: i32 = 0;
     for i in ROUND_JOBS {
         let r = qget<RoundResult>();
-        guard r.code == 0 else { abort(str("reader worker failed (code ", r.code, ")")); };
-        guard r.matched else { abort("reader worker decoded the wrong bytes"); };
+        if r.code != 0 || !r.matched {
+            round_failures++;
+            if first_failure == 0 { first_failure = r.code; }
+        }
         rounds_seen++;
     }
     guard rounds_seen == ROUND_JOBS else { abort("a round trip went missing"); };
+    guard round_failures == 0 else {
+        abort(str("reader worker failed (code ", first_failure, ") on ", round_failures,
+                  " of ", ROUND_JOBS, " members"));
+    };
 
     for id in ids { thread_wait(id); }
     for id in stream_ids { thread_wait(id); }

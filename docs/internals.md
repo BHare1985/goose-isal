@@ -119,7 +119,10 @@ Each of these was measured, not assumed.
     the same number means different things on different calls. `reader_status`
     translates the inflate family into `IGZIP_GS_*` codes in `-11..-15`, and
     `isal_inflate_set_dict`'s `-3` is read as `BadState` where it is called.
-    One `status_of` table then serves both families.
+    One `status_of` table then serves both families. Both tables are keyed on
+    numbers ISA-L owns, so every one of them is `_Static_assert`ed in the shim:
+    a renumbering there would otherwise turn `BadChecksum` into `BadState`, or
+    a zlib stream into a raw one, without failing to compile anywhere.
 13. **`isal_inflate_stateless` is honest about `avail_out`.** Unlike
     `isal_deflate_stateless` (behaviour 4), a destination one byte short returns
     `ISAL_OUT_OVERFLOW` having written exactly `dst.len` bytes, and an exact-size
@@ -141,7 +144,7 @@ Each of these was measured, not assumed.
     (2114 / 2257), and `dict_length` is written by the setter and both resets and
     read by nothing. The dictionary works purely as `tmp_out_buffer` history, so
     a wrong one is caught only by a gzip/zlib trailer. On `Wrapper.Raw` there is
-    no trailer and nothing catches it: wrong bytes, `Status.Ok`. That is
+    no trailer and nothing catches it: wrong bytes and no error. That is
     documented on `set_dict` and pinned by a test.
 16. **A gzip or zlib header is parsed in Goose, not by ISA-L.** `read_gzip_header`
     and `read_zlib_header` walk the container themselves over a `const u8[:]` and
@@ -226,13 +229,26 @@ appended. `Writer` and `Reader` share the lazy-init plus `pinned_self` copy
 guard, and each family of C statuses has its own range — the deflate family at
 `-8`/`-10`, inflate at `-11..-15` — so `status_of` stays one table.
 
-The reader's phase rules are the part of 0.3 a caller can get wrong, so they are
-a matrix in [design/0.3.0.md](design/0.3.0.md) §5 Q11 and asserted cell by cell
-in `test/inflate_contract.goose`. Two rules hold it together: `read` never ends
-a body (a member boundary is `finished(r)`, not a state change, so a caller that
-stops feeding can resume), and a terminal error latches the Reader `Finished`,
-because `isal_inflate` would otherwise answer `Ok` forever from a `FINISH` block
-state.
+The reader's phase rules are the part of the API a caller can get wrong, so
+they are written down here and asserted cell by cell in
+`test/inflate_contract.goose`:
+
+| verb | `Fresh` | `Open` | `Finished` |
+|---|---|---|---|
+| `read` | `Ok`, to `Open` | `Ok`; **stays `Open` when `finished(r)` becomes true** | `BadState` |
+| `finish` | `Truncated`, to `Finished` | `finished(r)` ? `Ok` : `Truncated`, to `Finished` | `BadState` |
+| `reset` | `Ok`, stays `Fresh` | `Ok`, to `Fresh` | `Ok`, to `Fresh` |
+| `set_dict` | `Ok` if raw/zlib, sets `has_dict` | `Ok` only where igzip allows (immediately after `NeedDict`), else `BadState` from igzip's own guard | `BadState` |
+| `inflate` | `Ok` to `Finished`; `TooSmall` stays `Fresh`; any other status to `Finished` | `BadState` | `BadState` |
+| `inflated` | `Finished` | `BadState` | `BadState` |
+| `finished`, `total_in`, `total_out`, `reader_size` | any | any | any |
+
+Two rules hold it together: `read` never ends a body (a member boundary is
+`finished(r)`, not a state change, so a caller that stops feeding can resume),
+and a terminal error latches the Reader `Finished`, because `isal_inflate` would
+otherwise answer `Ok` forever from a `FINISH` block state. `NeedDict` is the one
+status that does not latch: it is a request, and the next call is `set_dict` then
+`read`, both still `Open`.
 
 The zlib `window_bits` field is not cosmetic: the shim also sets
 `stream.hist_bits` to the same value before deflating. A 4 KiB window on the
@@ -285,11 +301,12 @@ checker is the regression test.
   in a temporary of the measured size; `MAX_HEADER` (1 MiB) caps that
   allocation, so an untrusted long name is `BadHeader` rather than an unbounded
   allocation.
-- **igzip does not write through its input pointer.** `isal_deflate_stateless`
-  and `isal_update_histogram` take `uint8_t *`, and the shim passes a
-  `const u8[:]` by casting away const. This was checked in the vendored sources:
-  neither writes through `next_in` / `start_stream`. Re-check if you add a call
-  that takes an input pointer.
+- **igzip does not write through its input pointer.** `isal_deflate_stateless`,
+  `isal_update_histogram` and `isal_create_hufftables` take non-const pointers,
+  and the shim passes a `const u8[:]` or a `const Trainer` by casting away
+  const. This was checked in the vendored sources: none of them writes through
+  `next_in` / `start_stream` / the histogram counts. Re-check if you add a call
+  that takes an input or const pointer.
 - **No globals, no mutable statics** in the shim, which is why two compressors in
   two threads share nothing and `igzip.build` does not declare
   `main_thread_only`. `test/threads.goose` exercises that with four workers.
@@ -372,11 +389,18 @@ server runs; `make check` covers the package and `make test` the tests.
   `ReaderState` directly; casting an `i32` to an enum is not allowed.
 - `resize` on a builder needs a fill value (`dst.resize(n, 0)`); there is no
   zero-initializing overload for `u8[>..]`.
-- A multiple return has to be taken whole: `let used, err = r.read(..)`. Binding
-  only the first value and then calling `err.ok()` reports
-  `unknown function or member: ok`, because `err` was inferred as `i64`.
-- A status and a count from the same call cannot be compared with each other:
-  compare the status against `Status.Ok` and the count separately.
+- A multiple return has to be taken whole: `let used, ok = r.read(..)`. Binding
+  only the first value leaves the second name referring to the count, and the
+  mistake surfaces later as a nonsense comparison rather than at the binding.
+- A status is out of band: `if !call { ... igzip::error() ... }`, and
+  `igzip::status()` narrowed by `if` before a `match`.
+- **A second format-driven build of a growable buffer in the main program is
+  miscompiled on windows-x64 by Goose v2026.4's MSVC output.** The first build
+  from an empty buffer is correct; later ones leave literal fragments at wrong
+  offsets and NUL holes, in a fresh buffer too, and only in `main` -- the same
+  function in a `thread_fn` is correct. `test/threads.goose` builds its largest
+  body once and slices prefixes. The signature to watch for is two bodies that
+  should be equal hashing differently.
 
 ## Conventions
 
@@ -386,8 +410,21 @@ server runs; `make check` covers the package and `make test` the tests.
 - Prose that explains *how to use* the package belongs in `docs/guide.md`; the
   README is a front page and the API tables. A behaviour that a maintainer must
   not undo belongs here.
-- `Status` is the only failure channel. Every C call goes through `status_of`;
-  igzip's negative codes never escape.
+- `Status` is the only failure channel. Every C call goes through `record`,
+  which stores its code for `status()`/`error()` and returns the call's bool;
+  igzip's negative codes never escape. `status_of` and `status_code` are the
+  inverse pair that names a code and finds it again, and both are
+  compiler-exhaustive over the enum.
+- **One piece of mutable state, per thread.** `src/igzip_shim.c` keeps
+  `_Thread_local int32_t gs_last_status`, written by every fallible call
+  (zero on success, so `status()` is null exactly when the bool was true) and
+  read only by `status()` / `error()`. It is the one exception to "no mutable
+  statics", it is per thread so two workers stay independent, and it means the
+  reason belongs to the *call*, not to the value: a caller that wants a
+  `Reader`'s failure to travel with it must ask immediately. Success records
+  zero, so `status()` is `Ok` exactly when the call's bool was true -- the first
+  cut left it alone on success and `test/roundtrip.goose` caught the stale read
+  that produced.
 - Validate in Goose when the check is about the API contract (level range, input
   size); validate in C when it is about pointers or sizes.
 - Tests assert; they do not print and hope. `test/contract.goose` keeps the
