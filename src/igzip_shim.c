@@ -322,6 +322,9 @@ static int32_t run(Compressor_g *s, igzip_slice_u8 src, gs_rref out, int32_t lev
 	c->zs.hufftables = NULL;
 
 	if (rc != COMP_OK) return rc;
+	/* The builder's top is moved by `written`, so a number larger than the room
+	 * offered would move it past data igzip never wrote. */
+	if (written > cap) return ISAL_INVALID_STATE;
 	bld_claim(out, written);
 	return COMP_OK;
 }
@@ -740,6 +743,14 @@ int32_t igzip_gs_writer_step(GooseWriter *w, igzip_slice_u8 src, uint8_t mode,
 	/* Borrowed input and output die with the call. */
 	s->next_in = NULL;
 	s->next_out = NULL;
+
+	if (consumed > (uint32_t)src.len || written > body_cap + header_written) {
+		w->state = GS_FINISHED;
+		*out_consumed = 0;
+		*out_written = 0;
+		*out_more = false;
+		return ISAL_INVALID_STATE;
+	}
 	w->total_in += consumed;
 	w->total_out += written;
 
@@ -984,6 +995,18 @@ int32_t igzip_gs_reader_step(GooseReader *r, igzip_slice_u8 src, igzip_slice_u8 
 	s->next_in = NULL;
 	s->next_out = NULL;
 
+	/* isal_inflate only ever decrements avail_in and avail_out, so these cannot
+	 * exceed what was offered. Check anyway: the alternative is trusting a
+	 * counter written by code this file does not own with the length of a memcpy
+	 * into the caller's buffer. */
+	if (consumed > (uint32_t)src.len || written > (uint32_t)dst.len) {
+		r->state = GS_R_FINISHED;
+		*out_consumed = 0;
+		*out_written = 0;
+		*out_finished = false;
+		return ISAL_INVALID_STATE;
+	}
+
 	r->total_in += consumed;
 	r->total_out += written;
 	if (r->state == GS_R_FRESH) r->state = GS_R_OPEN;
@@ -1030,6 +1053,13 @@ int32_t igzip_gs_reader_stateless(GooseReader *r, igzip_slice_u8 src, igzip_slic
 
 	s->next_in = NULL;
 	s->next_out = NULL;
+
+	if (consumed > (uint32_t)src.len || written > (uint32_t)dst.len) {
+		r->state = GS_R_FINISHED;
+		*out_consumed = 0;
+		*out_written = 0;
+		return ISAL_INVALID_STATE;
+	}
 
 	int32_t out = reader_status(raw);
 	if (out == IGZIP_GS_TOO_SMALL) {

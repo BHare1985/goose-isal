@@ -87,7 +87,9 @@ Each of these was measured, not assumed.
    `gzip_flag` or `hufftables`. `igzip_gs_writer_reset` clears the first three,
    re-points `level_buf`/`hufftables`, and zeroes the 64-bit totals.
 8. A stateful level-0 finish ends one stored byte differently from the
-   stateless path. Levels 1-3 are byte-identical. Both are valid deflate; the
+   stateless path. Levels 1-3 are byte-identical, measured on a chunked
+   `isal_deflate` loop against `isal_deflate_stateless` (120,233 bytes in,
+   8,045 out, `memcmp` equal). Both level-0 spellings are valid deflate; the
    tests compare levels 1-3 and decode level 0.
 9. A gzip custom header's `name` and `comment` must be NUL-terminated on the
    wire. ISA-L uses `strnlen` and does **not** add a terminator when the buffer
@@ -238,8 +240,6 @@ header with a 32 KiB match history makes strict decoders reject the stream with
 `invalid distance too far back`; `zlib.decompressobj(window_bits)` in the
 checker is the regression test.
 
-Nothing from libdeflate belongs here, ever.
-
 ## Memory safety notes
 
 - **The output bound is load-bearing.** `compress` lets igzip write straight
@@ -336,6 +336,22 @@ The boundary is `src/igzip_shim.c`; check these on every change that touches it.
 5. **No variadics, no callbacks, no statics.**
 6. **Build shape.** Native code is the CMake target `igzip_goose`; ISA-L comes
    from the submodule. No `c_libs`, no `extern "isal"` block, no system install.
+
+## Editors
+
+`goose lsp` serves diagnostics, hover, go-to-definition, rename, completion and
+formatting over stdio. It analyses the programs its client lists as entry files
+(`initializationOptions.entryFiles`) plus any open file none of them imports, and
+it fetches nothing.
+
+This repository is one package plus eleven other root programs, so a client that
+knows only the package sees the package and whichever test is open. List them
+all: `igzip.goose`, the eight `test/*.goose` roots, and the three
+`examples/*.goose` roots. `test/support/support.goose` is a module, not a root;
+it is analysed because the test roots import it.
+
+Every root file typechecks under `goose check`, which is the same analysis the
+server runs; `make check` covers the package and `make test` the tests.
 
 ## Goose pitfalls this code has hit
 

@@ -102,6 +102,22 @@ guard built.ok() else { abort(igzip::status_name(built)); };
 c.set_tables(tables);                  // level 0 from here on
 ```
 
+## Differences from zlib and gzip
+
+Worth reading before porting code, because none of these are bugs.
+
+| zlib / gzip | here |
+|---|---|
+| levels 0–9, where 0 means *store* | levels **0–3**, where 0 is the fastest, not stored — it compresses, with igzip's default table or a trained one |
+| `Z_DEFAULT_COMPRESSION` (-1) | no: level 1. A level outside 0..3 is `Status.BadLevel`, never clamped |
+| `Z_SYNC_FLUSH` / `Z_FULL_FLUSH` | `flush(Flush.Sync)` / `flush(Flush.Full)` |
+| `Z_FIXED`, `Z_RLE`, `Z_HUFFMAN_ONLY`, strategies | none: igzip has one strategy. Table choice is level 0's trained table or the default |
+| a window of 8–15 for every stream | zlib headers carry it (`window_bits`); gzip and raw are fixed at 32 KiB |
+| `crc32`, `adler32`, `crc32_combine` | not exposed — this package *verifies* trailers and does not compute them ([coverage.md](docs/coverage.md#the-checksum-decision)) |
+| a decompressor that sizes itself | `inflated` decodes a whole buffer into a new one; `inflate` needs the room up front, and `TooSmall` is how it asks for more |
+| gzip's mtime from the clock | 0 by default and `os` 0xff, so two runs over one body are byte-identical |
+| in-place decompression | not supported here either: `src` and `out` must be different buffers |
+
 ## Install and build
 
 ISA-L is a **pinned submodule** at `vendor/isa-l` (release `v2.32.1`, pinned by
@@ -112,7 +128,9 @@ commit and the bump procedure.
 
 The native build needs git (for the submodule), cmake, `nasm` and a C compiler.
 `nasm` is not optional in practice: without it ISA-L falls back to portable C and
-loses the kernels that are the reason to use ISA-L.
+loses the kernels that are the reason to use ISA-L. Development here is on
+x86-64 Linux; ISA-L also builds for aarch64 with its own assembly, which this
+package's tests have not been run against.
 
 ```bash
 make tools          # compiler version, ISA-L tag, nasm, cmake
@@ -125,6 +143,7 @@ make stress         # AddressSanitizer: bounds, staging, hostile input
 make verify         # check + tests + crosscheck + examples
 make bench          # native throughput benchmark
 make fmt            # layout is goose format's decision, not yours
+goose lsp           # editor integration: diagnostics, rename, completion, format
 ```
 
 `GOOSE_HOME` (default `~/.goose`) locates the toolchain and the package build
@@ -198,6 +217,35 @@ common form is `guard err.ok() else { ... }` and a specific case is
 `err == igzip::Status.BadTable`. The full list is in
 [docs/guide.md](docs/guide.md#errors).
 
+## Untrusted input
+
+A decompressor is the first place a caller feeds this package bytes it did not
+produce. What that means here:
+
+- **No input can make the package abort.** Every failure is a `Status`, including
+  a fabricated header, a bit flip, a truncation and a stream that claims a length
+  it does not have. There is no heap, so there is nothing to exhaust or leak.
+- **A corrupted payload may report `Ok` until you call `finish`.** igzip reports
+  completion in a block state, not a return code, so it cannot tell "not yet"
+  from "not ever". A caller that only watches for errors cannot distinguish a
+  truncated stream from a whole one.
+- **Expansion is not bounded.** `inflated` and `inflate` decode as much as the
+  stream asks for. For input you do not trust, use `read` and stop feeding it
+  when `r.total_out` passes your own cap.
+- **A wrong dictionary is only caught if there is a trailer.** On gzip and zlib
+  it is `BadChecksum` at the end; on raw there is no trailer and nothing catches
+  it — wrong bytes with `Status.Ok`.
+- **Header CRCs are reported, not verified.** `read_gzip_header` says whether an
+  FHCRC is present; `isal_inflate` steps over it too, so neither call rejects a
+  header on its CRC. Every *length* in a header is checked against the bytes
+  present before it is used.
+- **`src` and `out` must be different buffers.** A decoder reads ahead of what it
+  writes; the same buffer for both is accepted by the compiler and produces
+  garbage.
+
+`make stress` is the memory-safety half of this: two AddressSanitizer harnesses
+that allocate every buffer to its exact size.
+
 ## Documentation
 
 | | |
@@ -208,6 +256,16 @@ common form is `guard err.ok() else { ... }` and a specific case is
 | [docs/internals.md](docs/internals.md) | maintaining it: the pin, the memory model, the igzip behaviours the API encodes, the FFI gates |
 | [docs/design/](docs/design/) | the design briefs, with the measurements behind each decision |
 | [ROADMAP.md](ROADMAP.md) · [CHANGELOG.md](CHANGELOG.md) | where it is going, and what each release added |
+
+## Examples
+
+Three runnable programs, each a root file:
+
+| | |
+|---|---|
+| `examples/gzip_file.goose` | compress a file, then read it back to prove the result |
+| `examples/trained_table.goose` | train a table on a corpus and compress with it |
+| `examples/bench.goose` | throughput and ratio against a level, for your own data |
 
 ## Verification
 
@@ -244,6 +302,15 @@ import igzip from "BHare1985/goose-igzip@v0.3.0";
 
 Goose fetches the repo and its submodule. Until a tag exists, use a commit or a
 local path.
+
+## Acknowledgements
+
+[ISA-L](https://github.com/intel/isa-l)'s contributors, for the kernels this
+package exists to reach, and for a header (`igzip_lib.h`) clean enough to bind
+with nothing but `_Static_assert`s to keep it honest.
+[python-isal](https://github.com/pycompression/python-isal) is the binding ISA-L's
+own wiki points at, and reading it settled several behaviours this package
+encodes — that `isal_inflate` reports completion in a block state among them.
 
 ## License
 

@@ -39,6 +39,7 @@ behaviours the API encodes, the security notes, and the FFI review gates — is 
 | `goose build test/threads.goose -o build/threads_test` | native build; threads require it |
 | `goose build test/large_stream.goose -o build/large_stream` | 4.2 GiB through one writer |
 | `goose fetch igzip.goose` | fetch declared packages (none today) |
+| `goose lsp` | editor integration; list all twelve root programs as its entry files |
 | `goose format igzip.goose test examples` | rewrite in Goose layout |
 | `make verify` | check + JIT tests + thread test + large-stream test + examples |
 

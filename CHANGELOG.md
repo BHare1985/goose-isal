@@ -146,7 +146,6 @@ follow — state in Goose values, typed `Status`, the caller's choice of buffer.
 - ISA-L 2.32.1 is vendored as a pinned submodule and built with CMake, so
   nothing is installed system-wide. Building needs git, cmake, nasm and a C
   compiler.
-- libdeflate is out of scope, permanently.
 - Inputs above `MAX_INPUT` are rejected rather than truncated.
 - A `HuffTables` value that was never built, or was deserialized from storage,
   is validated before igzip sees it: a bogus header length returns

@@ -131,41 +131,6 @@ own API shape:
 | `mem_routines.h` | risks being slower than libc at small sizes, and Goose's own aggregated copies already cover the common case |
 | `crc16`, `crc64`, `crc32c` | no gzip stream needs them |
 | `crc32_gzip_refl`, `isal_adler32` | the trailer check, so a caller does not need one; a caller who wants a checksum value wants a checksum library, and this package verifies rather than computes (see [docs/coverage.md](docs/coverage.md#the-checksum-decision)) |
-| libdeflate | a different library entirely; a caller that wants it adds its own binding |
-
-## Decision record
-
-**Vendored submodule + CMake, not a system install.** Three approaches were
-considered:
-
-| Approach | Verdict |
-|---|---|
-| Require `libisal-dev` on the build machine | Rejected: works only where a distro version is installed, the version floats, and the shim can mix old headers with a new library |
-| Submodule + CMake target | **Chosen**: pinned, reproducible, full SIMD, one `git submodule update` from a clean checkout |
-| Submodule + `c_sources` listing ISA-L's `.c` files | Rejected: ISA-L's kernels are NASM, and the C files alone compile only with `igzip_base_aliases.c` standing in for the SIMD bodies — correct but several times slower, which discards the point of the library |
-
-This matches what established bindings do: [python-isal](https://github.com/pycompression/python-isal),
-the binding ISA-L's own wiki points at, carries ISA-L as a git submodule and
-builds it from source by default.
-
-**Stateless deflate, with streaming later.** A chunked `isal_deflate` loop was
-built and measured against the stateless path: the output is byte-identical
-(120,233 bytes in, 8,045 out, `memcmp` equal), so streaming is safe to add
-whenever a caller needs it. It was not used for 0.1.0 because:
-
-| | stateless (shipped) | chunked loop |
-|---|---|---|
-| C stack per call | 0 (state is in the `Compressor`) | ~430 KB with the level buffer, chunk buffer and stream in one frame |
-| output copies | writes once into the builder | every byte through a chunk buffer |
-| input limit | 2 GiB | none |
-
-The 2 GiB limit is the one real advantage, so streaming arrives in 0.2.0 with
-the buffers owned by the value rather than the stack.
-
-**Values, not handles.** An earlier revision kept igzip's state in C memory
-behind a `u64` handle with an explicit close. That is the C idiom, not the Goose
-one: a scope exit is already the free, and an explicit close is a leak waiting
-to happen. Everything a caller touches is now a fixed-size value.
 
 ## Measurements
 
@@ -174,27 +139,11 @@ Sizes, taken from the vendored headers. These decide the ownership model.
 | struct | bytes | consequence |
 |---|---|---|
 | `isal_zstream` | 82,384 | too big to pass by value per call, so it is a fixed blob in `Compressor` |
+| `inflate_state` | 87,368 | the same for `Reader`: state in the value, not on the C stack |
 | `isal_huff_histogram` | 18,912 | only 2,528 bytes are accumulators; the rest is per-call match scratch |
 | `isal_hufftables` | 2,232 | small enough to be a cache entry's field |
 | `ISAL_DEF_LVL3_MEDIUM` | 217,088 | level buffer for levels 1-3, carried by the value |
 | `ISAL_DEF_LVL1_DEFAULT` | 282,624 | why a level buffer must not live on the C stack |
 
-Behaviours, all verified against 2.32.1 and unchanged from 2.31.1:
-
-1. **A supplied Huffman table is used at level 0 only.** Levels 1-3 build their
-   own tables per block (`create_hufftables_icf`); a trained table at level 1
-   produced byte-identical output to the default one. `set_tables` therefore
-   pins the level to 0, and `compress` takes no level when a table is attached.
-2. **The histogram match scratch must be cleared between samples.**
-   `isal_update_histogram` keeps positions in `hash_table[8192]`; reusing them
-   across samples compares the new input against stale offsets.
-3. **`isal_deflate_stateless` can overrun an undersized output buffer** at
-   levels 2-3 instead of returning `STATELESS_OVERFLOW` (observed under
-   AddressSanitizer). `compress` therefore always supplies `bound(n)`, whose
-   worst case measured +23 bytes at 1 KiB and +103 bytes at 1 MiB.
-4. **igzip lengths are 32-bit.** Inputs above `MAX_INPUT` are rejected, never
-   silently truncated — including training samples, where truncation would
-   quietly train on half a body.
-5. **A table's header length is trusted by igzip.** `write_header` indexes
-   `deflate_hdr[deflate_hdr_count]`, so a fabricated or deserialized table is
-   validated before use and rejected as `Status.BadTable`.
+The behaviours these measurements explain are recorded, numbered, in
+[docs/internals.md](docs/internals.md#igzip-behaviour-this-api-encodes).
