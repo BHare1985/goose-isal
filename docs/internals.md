@@ -400,7 +400,10 @@ server runs; `make check` covers the package and `make test` the tests.
   read only by `status()` / `error()`. It is the one exception to "no mutable
   statics", it is per thread so two workers stay independent, and it means the
   reason belongs to the *call*, not to the value: a caller that wants a
-  `Reader`'s failure to travel with it must ask immediately.
+  `Reader`'s failure to travel with it must ask immediately. Success records
+  zero, so `status()` is `Ok` exactly when the call's bool was true -- the first
+  cut left it alone on success and `test/roundtrip.goose` caught the stale read
+  that produced.
 - Validate in Goose when the check is about the API contract (level range, input
   size); validate in C when it is about pointers or sizes.
 - Tests assert; they do not print and hope. `test/contract.goose` keeps the

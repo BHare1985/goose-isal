@@ -85,11 +85,12 @@ let MAX_HEADER = 1 << 20;
 let CHUNK_SIZE = 65536;
 
 // How a call ended. `Ok` is the only success.
-// Why a call failed. There is no success value: every call that can fail returns
-// a `bool`, and the reason is available from `status()` / `error()` — the shape
-// goose_gfx uses, where `gfx::open(..)` returns a bool and `gfx::error()` says
-// why. One value per distinct failure.
+// The outcome of a call that can fail: `Ok`, one of twelve named failures, or
+// `Other`. The call itself returns a `bool`, and the reason is available from
+// `status()` / `error()` -- the shape goose_gfx uses, where `gfx::open(..)`
+// returns a bool and `gfx::error()` says why.
 enum Status {
+    Ok,
     Overflow,     // input too large for igzip's 32-bit lengths
     BadLevel,     // level outside 0..3
     BadLevelBuf,  // igzip's level buffer unusable
@@ -105,44 +106,11 @@ enum Status {
     Other,        // an igzip error this package does not name
 }
 
-// A stable address for each variant, so `status()` can hand one back as a
-// reference without allocating per call.
-const E_OVERFLOW:      Status = Status.Overflow;
-const E_BAD_LEVEL:     Status = Status.BadLevel;
-const E_BAD_LEVEL_BUF: Status = Status.BadLevelBuf;
-const E_BAD_STATE:     Status = Status.BadState;
-const E_BAD_WRAPPER:   Status = Status.BadWrapper;
-const E_BAD_TABLE:     Status = Status.BadTable;
-const E_BAD_HEADER:    Status = Status.BadHeader;
-const E_TRUNCATED:     Status = Status.Truncated;
-const E_TOO_SMALL:     Status = Status.TooSmall;
-const E_NEED_DICT:     Status = Status.NeedDict;
-const E_CORRUPT:       Status = Status.Corrupt;
-const E_BAD_CHECKSUM:  Status = Status.BadChecksum;
-const E_OTHER:         Status = Status.Other;
-
-fn failure(s: Status) -> const Status? {
-    return match s {
-        Overflow => E_OVERFLOW,
-        BadLevel => E_BAD_LEVEL,
-        BadLevelBuf => E_BAD_LEVEL_BUF,
-        BadState => E_BAD_STATE,
-        BadWrapper => E_BAD_WRAPPER,
-        BadTable => E_BAD_TABLE,
-        BadHeader => E_BAD_HEADER,
-        Truncated => E_TRUNCATED,
-        TooSmall => E_TOO_SMALL,
-        NeedDict => E_NEED_DICT,
-        Corrupt => E_CORRUPT,
-        BadChecksum => E_BAD_CHECKSUM,
-        Other => E_OTHER,
-    };
-}
-
 // The C return code a variant stands for: the inverse of status_of, so a
 // failure the Goose side decides on can be recorded the same way a C one is.
 fn status_code(s: Status) -> i32 {
     return match s {
+        Ok => 0,
         Overflow => -1,
         BadState => -3,
         BadLevel => -4,
@@ -402,7 +370,7 @@ fn wrapper_code(w: Wrapper) -> i32 {
 // number alone cannot be right for both.
 fn status_of(rc: i32) -> Status {
     return match rc {
-        0 => Status.Other,
+        0 => Status.Ok,
         -1 => Status.Overflow,
         -3 => Status.BadState,
         -4 => Status.BadLevel,
@@ -420,26 +388,24 @@ fn status_of(rc: i32) -> Status {
     };
 }
 
-// Why the last call failed, or null if it succeeded. Every call that can fail
-// records its outcome here, success included, so `status()` and the `bool` the
-// call returned always agree: `!ok` means `status()` is non-null.
+// Why the last call failed, or `Status.Ok` if it succeeded. Every call that can
+// fail records its outcome here, success included, so `status()` and the `bool`
+// the call returned always agree: `guard ok else` means `status()` is not `Ok`.
 //
 // It is per thread, so a worker's failure is its own, and it is the most recent
 // call's outcome rather than a history -- ask straight away, the way
 // `gfx::error()` is used.
-fn status() -> const Status? {
-    let rc = igzip_gs_last_status();
-    if rc == 0 { return null; }
-    return failure(status_of(rc));
+fn status() -> Status {
+    return status_of(igzip_gs_last_status());
 }
 
-// That reason as text, or "" when nothing has failed on this thread:
+// That reason as text, or "" when the last call succeeded:
 //
-//   if !w.finish(out) { abort(str("finish failed: ", igzip::error())); };
+//   guard w.finish(out) else { abort(str("finish failed: ", igzip::error())); };
 fn error() -> const u8[:] {
     let s = status();
-    if s { return status_name(s); }
-    return "";
+    if s == Status.Ok { return ""; }
+    return status_name(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -1082,6 +1048,7 @@ fn bound(n: i64) -> i64 {
 
 fn status_name(e: Status) -> const u8[:] {
     return match e {
+        Ok => "ok",
         Overflow => "input too large for igzip's 32-bit lengths",
         BadLevel => "compression level must be 0..3",
         BadLevelBuf => "igzip level buffer unusable",

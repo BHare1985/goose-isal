@@ -44,10 +44,10 @@ bound, which is what `inflate` and `TooSmall` exist for.
 var w = igzip::zlib_writer(1);
 var out: u8[>..] = [];
 
-if !w.write(header_json, out) { abort("write failed"); };
-if !w.flush(out) { abort("flush failed"); };   // a decode point
-if !w.write(rows_json, out) { abort("write failed"); };
-if !w.finish(out) { abort("finish failed"); };
+guard w.write(header_json, out) else { abort("write failed"); };
+guard w.flush(out) else { abort("flush failed"); };   // a decode point
+guard w.write(rows_json, out) else { abort("write failed"); };
+guard w.finish(out) else { abort("finish failed"); };
 ```
 
 The lifecycle is `Fresh → HeaderWritten → Open → Flushed → Finished`, with
@@ -76,9 +76,9 @@ var r = igzip::gzip_reader();
 var body: u8[>..] = [];
 
 let used, ok = r.read(gz, body);
-if !ok { abort(str("read failed: ", igzip::error())); };
+guard ok else { abort(str("read failed: ", igzip::error())); };
 guard r.finished() else { abort("member is incomplete: feed more"); };
-if !r.finish() { abort("truncated"); };
+guard r.finish() else { abort("truncated"); };
 ```
 
 `read` returns a count as well as a status because decompression does not consume
@@ -108,13 +108,13 @@ cannot go on reading `Ok` out of a dead stream. `finish` after such an error is
 var pos: i64 = 0;
 loop {
     let used, ok = r.read(all[pos..], body);
-    if !ok { abort(str("read failed: ", igzip::error())); };
+    guard ok else { abort(str("read failed: ", igzip::error())); };
     pos += used;
     if !r.finished() { break; }
     if pos == all.len { break; }
-    if !r.reset() { abort("reset failed"); };
+    guard r.reset() else { abort("reset failed"); };
 }
-if !r.finish() { abort("truncated"); };
+guard r.finish() else { abort("truncated"); };
 ```
 
 `inflated(src)` runs that loop for you and joins the members. Trailing garbage
@@ -159,9 +159,9 @@ var w = igzip::gzip_writer(1);
 var out: u8[>..] = [];
 let hdr = igzip::GzipHeader { os: 3, name: "report.csv", mtime: 0 };
 
-if !w.write_gzip_header(hdr, out) { abort("header failed"); };
-if !w.write(body, out) { abort("write failed"); };
-if !w.finish(out) { abort("finish failed"); };
+guard w.write_gzip_header(hdr, out) else { abort("header failed"); };
+guard w.write(body, out) else { abort("write failed"); };
+guard w.finish(out) else { abort("finish failed"); };
 ```
 
 `mtime` defaults to 0 and `os` to 0xff, so a header left alone is reproducible.
@@ -184,7 +184,7 @@ buffer without decoding or copying anything. They report the fields and the
 
 ```goose
 var info, ok = igzip::read_gzip_header(gz);
-if !ok { abort(str("header failed: ", igzip::error())); };
+guard ok else { abort(str("header failed: ", igzip::error())); };
 
 let name = gz[info.name_at..][..info.name_len];   // name_at is -1 when absent
 let body = gz[info.body_at..];                    // the deflate stream
@@ -216,9 +216,9 @@ A preset dictionary is history both sides already have, so it need not be sent.
 
 ```goose
 var w = igzip::zlib_writer(1);
-if !w.set_dict(dictionary) { abort("dictionary failed"); };
-if !w.write(payload, out) { abort("write failed"); };
-if !w.finish(out) { abort("finish failed"); };
+guard w.set_dict(dictionary) else { abort("dictionary failed"); };
+guard w.write(payload, out) else { abort("write failed"); };
+guard w.finish(out) else { abort("finish failed"); };
 ```
 
 A zlib stream with a dictionary advertises FDICT and DICTID automatically.
@@ -238,7 +238,7 @@ var out: u8[>..] = [];
 
 let used, err = r.read(member, out);
 guard err == igzip::Status.NeedDict else { /* no dictionary needed */ };
-if !r.set_dict(dictionary) { abort("set_dict failed"); };
+guard r.set_dict(dictionary) else { abort("set_dict failed"); };
 let u2, e2 = r.read(member[used..], out);      // continues from where it stopped
 ```
 
@@ -270,7 +270,7 @@ t.add(json_body);                              // sample bodies as they go by
 guard t.symbols() >= 64 * 1024 else { /* keep warming */ };
 
 let tables, built = t.build();
-if !built { abort(str("training failed: ", igzip::error())); };
+guard built else { abort(str("training failed: ", igzip::error())); };
 c.set_tables(tables);                          // level 0 from here on
 ```
 
@@ -330,7 +330,7 @@ Every call that can fail returns a `bool`, with any data in front of it:
 
 ```goose
 let used, ok = r.read(gz, body);
-if !ok { abort(str("read failed: ", igzip::error())); };
+guard ok else { abort(str("read failed: ", igzip::error())); };
 ```
 
 The reason is out of band, in the two accessors `goose_gfx` uses:
@@ -340,24 +340,26 @@ success included, which clears them — and both are per thread, so a worker's
 failure is its own:
 
 ```goose
-let err = igzip::status();
-if err {
-    match err {
+let used, ok = r.read(gz, body);
+guard ok else {
+    match igzip::status() {
         Truncated => { /* feed more, or re-fetch */ },
         Corrupt => { /* drop it */ },
         NeedDict => { /* set_dict, then keep reading */ },
-        _ => { /* anything else */ },
+        _ => { abort(igzip::error()); },
     }
 }
 ```
 
-`Status` names twelve failures plus `Other`, and prints itself, so
-`str("finish failed: ", igzip::error())` needs no second call. `status_name`
-gives the same words when you already hold a `Status`.
+`Status` is `Ok`, twelve named failures and `Other`; it prints itself, so
+`str("finish failed: ", err)` needs no `status_name` call. `igzip::status()`
+returns a plain `Status` — `Ok` when the call succeeded — so a caller can match
+it directly without unwrapping anything, as above.
 
-`guard` is still the right tool when the condition is not a status — `guard
-r.finished() else { ... }` — and a status-only call reads naturally negated:
-`if !w.finish(out) { ... }`.
+`guard` is the whole idiom: a call reports success as a `bool`, so `guard call
+else { ... }` is the shape, whether the call returns a status alone or data and
+a status. Non-status preconditions read the same way: `guard r.finished() else {
+... }`.
 
 One thing to expect: a corrupted payload often comes back as `Ok` with the member
 unfinished rather than as an error, because igzip reports completion in a block

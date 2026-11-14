@@ -11,17 +11,25 @@
   a call failed*) and `ok()` is gone.
 
   ```goose
-  if !w.finish(out) { abort(str("finish failed: ", igzip::error())); };
+  guard w.finish(out) else { abort(str("finish failed: ", igzip::error())); };
 
-  let err = igzip::status();
-  if err { match err { Truncated => ..., Corrupt => ..., _ => ... } }
+  guard ok else {
+      match igzip::status() {
+          Truncated => ...,
+          Corrupt => ...,
+          _ => ...,
+      }
+  }
   ```
 
-  Migrating: `guard x.ok()` becomes `if !x { ... }`, `assert(e == Status.Ok)`
+  `igzip::status()` returns a plain `Status` — `Ok` when the call succeeded — so
+  a caller branches on it directly, with no optional to unwrap.
+
+  Migrating: `guard x.ok()` becomes `guard x else`, `assert(e == Status.Ok)`
   becomes `assert(e)`, and a specific failure is `assert(!e)` followed by
-  `igzip::status()`. Every call records its outcome and success clears the
-  record, so `status()` is null exactly when the bool was true. The record is
-  per thread, so a worker's failure is its own.
+  `assert(igzip::status() == Status.X)`. Every call records its outcome and
+  success clears the record, so `status()` is `Ok` exactly when the bool was
+  true. The record is per thread, so a worker's failure is its own.
 - `Status` implements `format`, so `print(err)` needs no `status_name` call.
 
 ### Internals

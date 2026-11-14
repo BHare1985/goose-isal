@@ -16,7 +16,7 @@ import igzip;
 fn main() {
     var c = igzip::gzip_compressor(1);          // keep one per thread
     let gz, ok = c.compressed(body);            // fresh buffer in your destination
-    if !ok { abort(str("compress failed: ", igzip::error())); };
+    guard ok else { abort(str("compress failed: ", igzip::error())); };
 }
 ```
 
@@ -55,11 +55,11 @@ c.compress(body_b, out);
 var w = igzip::gzip_writer(1);
 var out: u8[>..] = [];
 
-if !w.write(chunk_a, out) { abort("write failed"); };
-if !w.flush(out) { abort("flush failed"); };      // a decode point
-if !w.write(chunk_b, out) { abort("write failed"); };
-if !w.finish(out) { abort("finish failed"); };     // the trailer
-if !w.reset() { abort("reset failed"); };          // next body
+guard w.write(chunk_a, out) else { abort("write failed"); };
+guard w.flush(out) else { abort("flush failed"); };      // a decode point
+guard w.write(chunk_b, out) else { abort("write failed"); };
+guard w.finish(out) else { abort("finish failed"); };     // the trailer
+guard w.reset() else { abort("reset failed"); };          // next body
 ```
 
 **Decompress.** `read` appends decoded bytes and tells you how much of your input
@@ -70,10 +70,10 @@ var r = igzip::gzip_reader();
 var body: u8[>..] = [];
 
 let used, ok = r.read(gz, body);
-if !ok { abort(str("read failed: ", igzip::error())); };
+guard ok else { abort(str("read failed: ", igzip::error())); };
 
 guard r.finished() else { abort("feed me more"); };   // member not complete yet
-if !r.finish() { abort("truncated"); };               // false means truncated
+guard r.finish() else { abort("truncated"); };               // false means truncated
 
 // gz[used..] is the next member, or trailing bytes that are not this one.
 ```
@@ -99,7 +99,7 @@ t.add(json_body);
 guard t.symbols() >= 64 * 1024 else { /* keep warming */ };
 
 let tables, built = t.build();
-if !built { abort(str("training failed: ", igzip::error())); };
+guard built else { abort(str("training failed: ", igzip::error())); };
 c.set_tables(tables);                  // level 0 from here on
 ```
 
@@ -219,16 +219,16 @@ the two accessors `goose_gfx` uses, recorded per thread so a worker's failure is
 its own.
 
 ```goose
-if !w.finish(out) { abort(str("finish failed: ", igzip::error())); };
+guard w.finish(out) else { abort(str("finish failed: ", igzip::error())); };
 
-let err = igzip::status();
-if err {
-    match err {
+let used, ok = r.read(gz, body);
+guard ok else {
+    match igzip::status() {
         Truncated => { /* feed more */ },
         Corrupt => { /* drop it */ },
         _ => { /* anything else */ },
     }
-}
+};
 ```
 
 The full list of statuses is in [docs/guide.md](docs/guide.md#errors).

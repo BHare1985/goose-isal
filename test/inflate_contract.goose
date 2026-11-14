@@ -707,9 +707,7 @@ fn test_larger_than_a_chunk() {
 // rather than a whole assertion shape at 40 call sites: with a bool return the
 // detail is out of band, in igzip::status().
 fn failed_as(want: igzip::Status) -> bool {
-    let s = igzip::status();
-    guard s else { return false; }
-    return s == want;
+    return igzip::status() == want;
 }
 
 fn main() {
