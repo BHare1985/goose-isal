@@ -380,6 +380,16 @@ server runs; `make check` covers the package and `make test` the tests.
   mistake surfaces later as a nonsense comparison rather than at the binding.
 - A status is out of band: `if !call { ... igzip::error() ... }`, and
   `igzip::status()` narrowed by `if` before a `match`.
+- **A second write into a growable `u8[>..]` in the main program is
+  miscompiled by Goose v2026.4's MSVC output on windows-x64.** The first
+  `format`-driven build of a body from an empty buffer is correct; the second
+  and later ones leave literal fragments at the wrong offsets and zeros in the
+  holes, in a fresh buffer as well, and in the main program only -- the same
+  function in a `thread_fn` produces the right bytes. `test/threads.goose`
+  therefore generates its largest body once and slices prefixes, which is what
+  it would do anyway. If a future test needs repeated generation in the main
+  program on Windows, verify against a checksum first: two bodies that should
+  be equal hashing differently is the signature.
 
 ## Conventions
 

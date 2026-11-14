@@ -11,7 +11,6 @@
 // two jobs carry the same input, so two different workers must report the same
 // compressed size.
 import std;
-import os;
 import igzip from "..";
 
 let WORKERS = 4;
@@ -153,10 +152,6 @@ thread_fn reader_worker() {
 
         body.clear();
         make_body(body, box.records);
-        // Generated twice, on purpose, while the Windows difference is open: if
-        // the two disagree the first body was overwritten between the calls.
-        var body2: u8[>..] = [];
-        make_body(body2, box.records);
         out.clear();
         let used, err = holder[0].read(box.data[..box.len], out);
         var code: i32 = 0;
@@ -178,18 +173,9 @@ thread_fn reader_worker() {
             print("threads: mismatch records=", box.records, " box.len=", box.len,
                   " out.len=", out.len, " body.len=", body.len, " at=", at,
                   " box.sum=", box.sum, " out.sum=", checksum(out),
-                  " body.sum=", checksum(body), " body2.sum=", checksum(body2));
+                  " body.sum=", checksum(body));
             show_around("  out", out, at);
             show_around("  body", body, at);
-            show_diffs(out, body, 8);
-            // The two buffers whole, for whoever has to look at the pattern:
-            // the decoded bytes are what the main thread compressed, so this
-            // is the corrupt body beside the one this worker generated.
-            if box.records == 175 {
-                assert(make_dir("build/tmp"));
-                assert(write_file("build/tmp/win_out.bin", out));
-                assert(write_file("build/tmp/win_body.bin", body));
-            }
             code = 3;
         } else if !holder[0].finish() {
             code = 4;
@@ -211,28 +197,6 @@ fn checksum(xs: const u8[:]) -> i64 {
     var h: i64 = 0;
     for x in xs { h = (h * 31 + x) % 1000000007; }
     return h;
-}
-
-// Up to `limit` disagreements as offset:out/body, with how many there are in
-// total: one block, one per record, and a shift look different here.
-fn show_diffs(out: const u8[:], body: const u8[:], limit: i64) {
-    var line: u8[>..] = [];
-    format(line, "  diffs:");
-    var total: i64 = 0;
-    var shown: i64 = 0;
-    var k:     i64 = 0;
-    while k < out.len && k < body.len {
-        if out[k] != body[k] {
-            total++;
-            if shown < limit {
-                format(line, " ", k, ":", out[k] as i64, "/", body[k] as i64);
-                shown++;
-            }
-        }
-        k++;
-    }
-    format(line, " (", total, " total)");
-    print(line);
 }
 
 // A log with no hexdump, for the bytes either side of the first difference.

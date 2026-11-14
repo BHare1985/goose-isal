@@ -127,16 +127,10 @@ jobs:
           goose build test/threads.goose -o "$RUNNER_TEMP/threads"
           "$RUNNER_TEMP/threads"
 
-      # Windows builds and links the threaded program -- which is the platform
-      # question this job exists to answer -- but its reader worker decodes the
-      # wrong bytes there (code 3 in test/threads.goose, run 43555546808). The
-      # build is asserted; the run is reported as a warning rather than an
-      # ##[error], because a tolerated failure that prints an error annotation
-      # reads as a red job in the log and in the pull request.
-      # Windows builds the threaded program and is expected to run it: the
-      # reader worker's mismatch was never the codec or the queue (igzip verified
-      # the gzip CRC of every member it decoded), so there is nothing to tolerate.
-      # A failing run is a failing job, with its diagnostics in the log.
+      # Windows builds and runs the threaded program like the other three. The
+      # run used to be tolerated with a warning; it is asserted now. What once
+      # failed there was the main program's body generation, not this package
+      # (ROADMAP.md, "Compiling a body twice in the main program").
       - name: threads (native, Windows)
         if: runner.os == 'Windows'
         shell: bash
@@ -144,16 +138,6 @@ jobs:
           set -euo pipefail
           goose build test/threads.goose -o "$RUNNER_TEMP/threads.exe"
           "$RUNNER_TEMP/threads.exe"
-
-      # While the Windows body difference is open, the failing run leaves the
-      # corrupt body and the worker's own generation behind; both are tiny.
-      - name: Windows thread bodies
-        if: runner.os == 'Windows' && failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-thread-bodies
-          path: build/tmp/win_*.bin
-          if-no-files-found: ignore
 
       - name: 4.2 GiB round trip (native)
         if: runner.os != 'Windows'
@@ -178,16 +162,6 @@ jobs:
         run: |
           set -euo pipefail
           GOOSE_HOME="$HOME/.goose" make crosscheck
-
-      # Is the Windows threads difference about threads at all? This is the same
-      # package, built the same way, with no thread_fn and no queue.
-      - name: round trip under MSVC AOT (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          goose build test/roundtrip.goose -o "$RUNNER_TEMP/roundtrip.exe"
-          "$RUNNER_TEMP/roundtrip.exe"
 
       - name: examples typecheck
         shell: bash
