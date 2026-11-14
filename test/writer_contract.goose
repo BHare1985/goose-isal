@@ -570,6 +570,12 @@ fn test_trained(body: const u8[:], tables: const igzip::HuffTables&) {
 
 // The shim's output loop must drain a destination much smaller than its normal
 // 64 KiB chunk without losing or duplicating bytes.
+//
+// The assertion is the decoded bytes, not equality with a one-shot stream. An
+// 8-byte destination makes igzip drain through its staging buffer, which can put
+// block boundaries somewhere else: below the 32 KiB internal buffer the two
+// spellings are allowed to differ, and a stream that decodes correctly is the
+// contract either way.
 fn test_tiny_output() {
     var body: u8[>..] = [];
     support::body_of(body, 16384);
@@ -577,7 +583,7 @@ fn test_tiny_output() {
     var out: u8[>..] = [];
     assert(step_tiny(w, body, 0, out));
     assert(step_tiny(w, "", 3, out));
-    assert(support::same(out, one_shot(body, igzip::Wrapper.Raw, 1)));
+    assert(support::same(decoded(igzip::Wrapper.Raw, out), body));
 }
 
 fn test_errors(body: const u8[:]) {
