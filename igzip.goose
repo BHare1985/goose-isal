@@ -63,6 +63,10 @@ let MAX_INPUT = 0x7FFFFFF0;
 // bytes but places no bound on `name` or `comment`; this API does.
 let MAX_HEADER = 1 << 20;
 
+// Output staging shared by the streaming values: compressed bytes accumulate
+// here until the caller's destination is handed them.
+let CHUNK_SIZE = 65536;
+
 // How a call ended. `Ok` is the only success.
 enum Status {
     Ok,
@@ -162,20 +166,20 @@ struct ZlibHeader {
 // pointers in the original; the C side records the Writer's address and returns
 // `Status.BadState` for such a copy. Call `reset` to recover a copy.
 struct Writer {
-    stream:      u64[10298]  = [0; 10298],
-    level_buf:   u64[27136]  = [0; 27136],
-    chunk:       u8[65536]   = [0; 65536],
-    tables:      u64[279]    = [0; 279],
-    pinned_self: u64         = 0,
-    total_in:    u64         = 0,
-    total_out:   u64         = 0,
-    dict_id:     u32         = 0,
-    base_level:  i32         = 1,
-    wrap:        Wrapper     = Wrapper.Gzip,
-    state:       WriterState = WriterState.Fresh,
-    has_tables:  bool        = false,
-    has_dict:    bool        = false,
-    hdr_written: bool        = false,
+    stream:      u64[10298]     = [0; 10298],
+    level_buf:   u64[27136]     = [0; 27136],
+    chunk:       u8[CHUNK_SIZE] = [0; CHUNK_SIZE],
+    tables:      u64[279]       = [0; 279],
+    pinned_self: u64            = 0,
+    total_in:    u64            = 0,
+    total_out:   u64            = 0,
+    dict_id:     u32            = 0,
+    base_level:  i32            = 1,
+    wrap:        Wrapper        = Wrapper.Gzip,
+    state:       WriterState    = WriterState.Fresh,
+    has_tables:  bool           = false,
+    has_dict:    bool           = false,
+    hdr_written: bool           = false,
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +362,12 @@ fn write(w: Writer&, src: const u8[:], out: u8[>..]&) -> Status {
     return write_windowed(w, src, out, MAX_IN_STEP);
 }
 
+// Hands the bytes a streaming value produced to the caller's builder. Kept
+// separate so every streaming verb drains a staging chunk the same way.
+fn append_output(out: u8[>..]&, chunk: const u8[:], n: u32) {
+    if n > 0 { out.append(chunk[..n]); }
+}
+
 // One window: feed igzip until it has taken every byte of `src` and drained
 // its output. A zero-progress result would loop forever, so it is a Status
 // rather than a hang.
@@ -369,7 +379,7 @@ fn write_window(w: Writer&, src: const u8[:], out: u8[>..]&) -> Status {
         var more = false;
         let rc = igzip_gs_writer_step(w, src[consumed..], 0, w.chunk, used, written, more);
         if rc != 0 { return status_of(rc); }
-        if written > 0 { out.append(w.chunk[..written]); }
+        append_output(out, w.chunk, written);
         consumed += used;
         if !more { return Status.Ok; }
         if used == 0 && written == 0 { return Status.Other; }
@@ -403,7 +413,7 @@ fn step_empty(w: Writer&, mode: u8, out: u8[>..]&) -> Status {
         var more = false;
         let rc = igzip_gs_writer_step(w, "", mode, w.chunk, used, written, more);
         if rc != 0 { return status_of(rc); }
-        if written > 0 { out.append(w.chunk[..written]); }
+        append_output(out, w.chunk, written);
         if !more { return Status.Ok; }
         if used == 0 && written == 0 { return Status.Other; }
     }
@@ -461,11 +471,11 @@ fn write_gzip_header(w: Writer&, hdr: GzipHeader, out: u8[>..]&) -> Status {
                                              written2, needed2);
         if rc2 != 0 { return status_of(rc2); }
         if needed2 > 0 { return Status.BadHeader; }
-        out.append(big[..written2]);
+        append_output(out, big, written2);
         return Status.Ok;
     }
 
-    if written > 0 { out.append(w.chunk[..written]); }
+    append_output(out, w.chunk, written);
     return Status.Ok;
 }
 
@@ -477,7 +487,7 @@ fn write_zlib_header(w: Writer&, hdr: ZlibHeader, out: u8[>..]&) -> Status {
     let rc = igzip_gs_writer_zlib_header(w, hdr.window_bits, hdr.flevel, hdr.dict_flag,
                                         hdr.dict_id, w.chunk, written);
     if rc != 0 { return status_of(rc); }
-    if written > 0 { out.append(w.chunk[..written]); }
+    append_output(out, w.chunk, written);
     return Status.Ok;
 }
 

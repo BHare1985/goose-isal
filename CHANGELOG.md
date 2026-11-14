@@ -30,9 +30,9 @@ one-shot 2 GiB limit.
   shared generators in `test/support/`. Covers one-shot/chunked equivalence,
   Sync/Full decode points, custom and 65 KiB headers, zlib windows,
   dictionaries with and without the dictionary, trained tables and a mid-flush
-  swap, lifecycle misuse, initialized-writer copies, a 4.2 GiB stream,
-  two streaming thread workers, 18 new independently decoded streams (43 total), and
-  stateful output-buffer/header stress cases under AddressSanitizer.
+  swap, lifecycle misuse, initialized-writer copies, a 4.2 GiB stream, two
+  streaming thread workers, 18 new independently decoded streams (43 total),
+  and stateful output-buffer/header stress cases under AddressSanitizer.
 
 ### Fixed
 
@@ -82,20 +82,6 @@ follow — state in Goose values, typed `Status`, the caller's choice of buffer.
   members and concatenated runs), a four-worker thread test, and
   `scripts/bound_stress.c`, which checks the output bound as an exact buffer
   size under AddressSanitizer.
-
-### Fixed
-
-- A custom zlib `window_bits` now sets `stream.hist_bits` as well as the CMF
-  field. Before this, a 4 KiB header could be followed by 32 KiB match
-  distances, and a strict decoder rejected the stream with `invalid distance
-  too far back`. The checker now decodes with `zlib.decompressobj(window_bits)`.
-- `Writer` validates its table at use, not only in `set_tables`, so a
-  deserialized `Writer` or a caller mutating the public `tables` field cannot
-  hand igzip an unvalidated header length. A `Fresh` Writer carrying
-  `has_dict`/`hdr_written` without a pinned C stream is refused.
-- `MAX_HEADER` (1 MiB) bounds the temporary used for a gzip header larger than
-  the 64 KiB chunk, so an untrusted `name`/`comment` cannot force an unbounded
-  allocation.
 
 ### Notes
 

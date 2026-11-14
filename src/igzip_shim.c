@@ -103,9 +103,10 @@ typedef struct {
 
 #define GS_CHUNK 65536
 
-/* Not ISA-L codes: a header field the API cannot encode (an interior NUL,
- * too-long name/comment/extra, or an impossible zlib flag), and a Writer whose
- * public table field was mutated or deserialized without validation. */
+/* Package-specific statuses occupy -8 and -10; keep any new code disjoint
+ * from ISA-L's own negative returns. -8 is a header the API cannot encode (an
+ * interior NUL, too-long name/comment/extra, or an impossible zlib flag); -10
+ * is a Writer table that failed validation at use. */
 #define IGZIP_GS_BAD_HEADER (-8)
 #define IGZIP_GS_BAD_TABLE (-10)
 

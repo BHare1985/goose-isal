@@ -122,6 +122,12 @@ Deliberately not exposed in 0.2, with the reason:
   compression decisions; it is not a 0.2 knob.
 - **`isal_inflate_*`, `isal_read_*`, checksums** — 0.3 and 0.4.
 
+The streaming values share `CHUNK_SIZE` and the `append_output` helper in
+`igzip.goose`: output is staged in a fixed chunk and only the bytes produced are
+appended. The same lazy-init plus `pinned_self` copy guard is the intended shape
+for another stateful value, and package-specific C statuses stay below ISA-L's
+range so the next error family can take a disjoint code.
+
 The zlib `window_bits` field is not cosmetic: the shim also sets
 `stream.hist_bits` to the same value before deflating. A 4 KiB window on the
 header with a 32 KiB match history makes strict decoders reject the stream with
